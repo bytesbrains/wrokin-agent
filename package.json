@@ -1,0 +1,16 @@
+{
+  "name": "wrokin-agent",
+  "private": true,
+  "description": "wrokin's Builder-family agent as a GitHub Action. Not published to npm: the action runs from this repository.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.0"
+  }
+}

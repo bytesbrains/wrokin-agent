@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  # The action's own `uses:` (setup-node, upload-artifact) and the CI below.
+  - package-ecosystem: github-actions
+    directories: ["/", "/.github/workflows"]
+    schedule:
+      interval: weekly

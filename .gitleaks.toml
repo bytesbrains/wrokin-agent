@@ -1,0 +1,16 @@
+# gitleaks: the default rules, a rule for Cruise keys (the credential this action
+# handles, which the defaults don't know), and the ONE exact decoy value the tests use
+# to prove a key is masked. Allowlisted by value, not by path, so a real key pasted into
+# a test file is still caught.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "cruise-api-key"
+description = "BytesBrains Cruise API key"
+regex = '''\bcru_(?:live|test)_[A-Za-z0-9]{16,}\b'''
+keywords = ["cru_live_", "cru_test_"]
+
+[[allowlists]]
+description = "checkin.test.mjs decoy Cruise key (not a credential)"
+regexes = ['''cru_live_decoy_key_9f3a''']

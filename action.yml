@@ -1,0 +1,152 @@
+name: "wrokin agent (Builder family)"
+description: "Run a wrokin Builder-family agent: pi, on this runner, calling Cruise directly. No wrok.in brain steers the run (#803)."
+author: "BytesBrains"
+branding:
+  icon: "git-pull-request"
+  color: "blue"
+inputs:
+  cruise_api_key:
+    description: "Cruise API key. Empty: fetch the key from the Builder card on wrok.in at job start (needs id-token: write)."
+    required: false
+    default: ""
+  model:
+    description: "Cruise lane or model id. A lane (bb/*) lets Cruise pick and fall back across vendors. Empty: the Builder card's choice, else bb/builder."
+    required: false
+    default: ""
+  cruise_base_url:
+    description: "Cruise base URL. Empty: what wrok.in returns at check-in, else https://cruise.bytesbrains.net/v1."
+    required: false
+    default: ""
+  wrokin_api_base:
+    description: "wrok.in API base for the check-in. Used only when cruise_api_key is empty."
+    required: false
+    default: "https://api.wrok.in"
+  issue_number:
+    description: "Issue to work on. Defaults to the triggering issue. Empty: set up and check only, run nothing."
+    required: false
+    default: ${{ github.event.issue.number }}
+  role:
+    description: "Which Builder-family role runs. Today: builder."
+    required: false
+    default: "builder"
+  github_token:
+    description: "Token for reading the issue, pushing the branch and opening the PR when the run doesn't check in (cruise_api_key given). With check-in, a wrokin App token for this repo is used instead. Never given to pi."
+    required: false
+    default: ${{ github.token }}
+  test_command:
+    description: "Command that proves the change. Defaults to the repo's npm/pnpm/yarn test script, or go test."
+    required: false
+    default: ""
+  base_branch:
+    description: "Branch the PR targets. Defaults to the branch the workflow ran on."
+    required: false
+    default: ""
+  timeout_minutes:
+    description: "Wall-clock limit for the agent, and separately for the verify step."
+    required: false
+    default: "30"
+outputs:
+  pi:
+    description: "Path of the pi binary this run uses."
+    value: ${{ steps.setup.outputs.pi }}
+  agent_dir:
+    description: "This run's pi config directory (PI_CODING_AGENT_DIR)."
+    value: ${{ steps.setup.outputs.agent_dir }}
+  pi_version:
+    description: "The pi version in use."
+    value: ${{ steps.setup.outputs.pi_version }}
+runs:
+  # Composite, not a container action: a wrokin-agent runner has no docker socket
+  # (bytesbrains/wrokin-actions#11), so it couldn't start one.
+  using: composite
+  steps:
+    - id: node
+      shell: bash
+      run: |
+        # The minimum comes from pins.json and nowhere else. Read with sed, not node
+        # (missing or too old is why this step exists) and not jq (not on every runner).
+        min="$(sed -n 's/^ *"node": *"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' "$GITHUB_ACTION_PATH/pins.json")"
+        [ -n "$min" ] || { echo "::error title=wrokin-agent setup::pins.json has no valid .node version"; exit 1; }
+        echo "min=$min" >> "$GITHUB_OUTPUT"
+        have="$(node --version 2>/dev/null | sed 's/^v//')"
+        if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$min" "$have" | sort -V | head -1)" = "$min" ]; then
+          echo "need=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "need=true" >> "$GITHUB_OUTPUT"
+        fi
+    # A caret range, not "22": setup-node takes a locally cached match first, and a
+    # self-hosted runner can have a 22.x older than pi accepts in its tool cache.
+    - if: steps.node.outputs.need == 'true'
+      uses: actions/setup-node@v7
+      with:
+        node-version: "^${{ steps.node.outputs.min }}"
+    # Every later step runs this action from a copy the runner owns, outside the checkout.
+    # The checkout is handed to the agent's user (#832); when the action lives inside it
+    # (`uses: ./actions/wrokin-agent`), the agent could otherwise rewrite the scripts that
+    # run after it with the GitHub token, revoke-token.mjs among them.
+    - id: src
+      shell: bash
+      run: |
+        dir="$RUNNER_TEMP/wrokin-agent-src"
+        rm -rf "$dir" && cp -R "$GITHUB_ACTION_PATH" "$dir"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+    # Key, model and base URL, once. With no cruise_api_key input this is the run's one
+    # call to wrok.in, and the key is masked before anything else prints (#813). It also
+    # returns this run's wrokin App token for GitHub (#817), masked the same way.
+    - id: creds
+      shell: bash
+      env:
+        INPUT_CRUISE_API_KEY: ${{ inputs.cruise_api_key }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_CRUISE_BASE_URL: ${{ inputs.cruise_base_url }}
+        INPUT_WROKIN_API_BASE: ${{ inputs.wrokin_api_base }}
+        INPUT_ROLE: ${{ inputs.role }}
+      run: node "${{ steps.src.outputs.dir }}/checkin.mjs"
+    - id: preflight
+      shell: bash
+      env:
+        CRUISE_API_KEY: ${{ inputs.cruise_api_key || steps.creds.outputs.cruise_api_key }}
+        CRUISE_BASE_URL: ${{ steps.creds.outputs.cruise_base_url }}
+        MODEL: ${{ steps.creds.outputs.model }}
+      run: node "${{ steps.src.outputs.dir }}/preflight.mjs"
+    - id: setup
+      shell: bash
+      run: node "${{ steps.src.outputs.dir }}/setup-pi.mjs"
+    - id: run
+      if: inputs.issue_number != ''
+      shell: bash
+      env:
+        INPUT_ROLE: ${{ inputs.role }}
+        INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        INPUT_MODEL: ${{ steps.creds.outputs.model }}
+        INPUT_CRUISE_BASE_URL: ${{ steps.creds.outputs.cruise_base_url }}
+        INPUT_CRUISE_API_KEY: ${{ inputs.cruise_api_key || steps.creds.outputs.cruise_api_key }}
+        INPUT_GITHUB_TOKEN: ${{ steps.creds.outputs.github_token || inputs.github_token }}
+        INPUT_TEST_COMMAND: ${{ inputs.test_command }}
+        INPUT_BASE_BRANCH: ${{ inputs.base_branch }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        INPUT_PI: ${{ steps.setup.outputs.pi }}
+        INPUT_AGENT_DIR: ${{ steps.setup.outputs.agent_dir }}
+      run: node "${{ steps.src.outputs.dir }}/main.mjs"
+    # Setup failed before the run could say anything: tell the issue, not just the log.
+    - if: failure() && inputs.issue_number != ''
+      shell: bash
+      env:
+        INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        INPUT_GITHUB_TOKEN: ${{ steps.creds.outputs.github_token || inputs.github_token }}
+      run: node "${{ steps.src.outputs.dir }}/report-failure.mjs"
+    - if: always() && inputs.issue_number != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: wrokin-agent-${{ inputs.role }}-issue-${{ inputs.issue_number }}
+        path: |
+          ${{ runner.temp }}/wrokin-agent/pi-events.jsonl
+          ${{ runner.temp }}/wrokin-agent/agent-logs/
+        if-no-files-found: ignore
+        retention-days: 14
+    # Last, whatever happened: the check-in token dies with the job, not an hour later.
+    - if: always() && steps.creds.outputs.github_token != ''
+      shell: bash
+      env:
+        INPUT_GITHUB_TOKEN: ${{ steps.creds.outputs.github_token }}
+      run: node "${{ steps.src.outputs.dir }}/revoke-token.mjs"
