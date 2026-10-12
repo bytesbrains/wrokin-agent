@@ -243,47 +243,6 @@ export function describeCommits({ dir, base, branch, env, run = git }) {
 }
 
 /**
- * The files the checks read besides package.json's scripts (#870): the TypeScript and
- * test-runner configs. `"strict": false` or an `exclude` turns a failing typecheck green
- * without touching the script, so a run that changes one can't be called verified.
- */
-export const CHECK_CONFIGS = [
-  "tsconfig*.json",
-  "jsconfig*.json",
-  "vitest.config.*",
-  "vitest.workspace.*",
-  "vite.config.*",
-  "jest.config.*",
-  ".mocharc*",
-  "karma.conf.*",
-  "ava.config.*",
-  "playwright.config.*",
-].map((f) => `:(glob)**/${f}`);
-
-/**
- * The check configs the branch adds, changes or deletes over `base`, from the runner's
- * copy. `--no-renames`: a config renamed away still shows, as the deletion it is.
- */
-export function changedCheckConfigs({ dir, base, branch, env, run = git }) {
-  const r = run(["diff", "--name-only", "--no-renames", `${base}..refs/heads/${branch}`, "--", ...CHECK_CONFIGS], {
-    cwd: dir,
-    env: runnerGitEnv(env),
-  });
-  if (r.code !== 0) {
-    console.log(`::warning title=wrokin-agent check configs::git diff failed: ${r.out.slice(0, 300)}`);
-    return [];
-  }
-  return r.out.split("\n").filter(Boolean);
-}
-
-/** The proof-run's result once the agent's check-config changes are counted against it. */
-export function withConfigChanges(result, files) {
-  if (!files.length) return result;
-  const names = files.map((f) => `\`${f}\``).join(", ");
-  return { ...result, verified: false, reason: `${result.reason}; the agent changed ${names}, which the checks read` };
-}
-
-/**
  * What the PR says when the agent wrote no summary (#855): what the branch holds and
  * how far it got, so a reviewer never gets only "left no summary".
  */
@@ -332,6 +291,9 @@ function setupSection(setup) {
   ];
   if (setup.changedConfigs?.length) {
     lines.push(`- **Check config changed in this run:** ${setup.changedConfigs.map((f) => `\`${f}\``).join(", ")} (so the PR is a draft)`);
+  }
+  if (setup.unpushedConfigs?.length) {
+    lines.push(`- **Check config in the checkout but not in this PR:** ${setup.unpushedConfigs.map((f) => `\`${f}\``).join(", ")} (so the PR is a draft)`);
   }
   if (setup.premises.missing.length) {
     lines.push(`- **Named in the issue, not on the base:** ${setup.premises.missing.map((m) => `\`${m}\``).join(", ")}`);

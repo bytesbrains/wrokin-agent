@@ -283,7 +283,7 @@ export function runPrompt({ role, base, minutes, checks, premises, guidelines })
     cmds.length
       ? `- **Checks:** run ${cmds.map((c) => `\`${c}\``).join(" and ")} before you finish, and fix what fails. ` +
         "The workflow runs them again after you exit, and a failure makes the PR a draft. So does a change to " +
-        "a tsconfig or test-runner config: fix the code, not the check."
+        "a tsconfig or test-runner config, including one you leave out of the commit: fix the code, not the check."
       : "- **Checks:** the repository declares no test or typecheck command. Say so in your summary.",
   ];
   if (checks.typecheck) {

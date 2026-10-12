@@ -27,11 +27,11 @@ import {
 import { modelsJson, piEnv, scrubbedEnv, wantsThinkingSwitch } from "./pi-config.mjs";
 import { formatTopTools, piArgs, runPi, summarizeFile } from "./run-pi.mjs";
 import { sh, verify } from "./verify.mjs";
+import { changedCheckConfigs, unpushedCheckConfigs, withConfigChanges } from "./check-configs.mjs";
 import { asPiUser, cleanUp, killPiProcesses, piHome, prepare, reclaim, restoreLocalAction } from "./isolate.mjs";
 import {
   branchName,
   buildJobSummary,
-  changedCheckConfigs,
   collectCommits,
   cutoffReason,
   describeCommits,
@@ -48,7 +48,6 @@ import {
   runnerGitEnv,
   saveAgentLogs,
   timeLimitCutoff,
-  withConfigChanges,
 } from "./publish.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -296,6 +295,8 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
     );
   }
 
+  // Before the proof-run, so nothing the tests write is counted (#891).
+  const unpushedConfigs = unpushedCheckConfigs({ workspace: i.workspace, dir: publishDir, branch, env: gitEnv });
   // The tests are code the agent wrote, so they run as its user too.
   const proofRun = await verify({
     dir: i.workspace,
@@ -310,7 +311,7 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
   killPiProcesses();
   // A green check proves nothing when the agent rewrote what it reads (#870).
   const changedConfigs = changedCheckConfigs({ dir: publishDir, base, branch, env: gitEnv });
-  const result = withConfigChanges(proofRun, changedConfigs);
+  const result = withConfigChanges(proofRun, changedConfigs, unpushedConfigs);
   const pushed = pushBranch({
     cwd: publishDir,
     env: runnerGitEnv(gitEnv),
@@ -333,7 +334,7 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
     model: i.model,
     usage,
     cutoff,
-    setup: { ...setup, guidelines: setup.guidelines.map((g) => g.path), changedConfigs },
+    setup: { ...setup, guidelines: setup.guidelines.map((g) => g.path), changedConfigs, unpushedConfigs },
     fallback,
   });
   const ready = isReady(result, cutoff);
