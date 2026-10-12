@@ -7,14 +7,24 @@ questions during the run, so make sensible decisions and note them in your summa
 ### How to work
 
 1. Read the issue, then read the code it touches before changing anything. Follow the
-   repository's own conventions: its AGENTS.md / CLAUDE.md files, its existing style,
-   naming and test patterns.
-2. Make the smallest change that satisfies the issue's acceptance criteria. Don't
+   repository's guidelines (under "Repository guidelines" below, when it has any) and
+   its existing style, naming and test patterns.
+   **Read by range.** Find what you need first (`grep`, `find`), then read that part
+   with `read`'s `offset` and `limit`. Everything you read is sent again on every later
+   turn, so a whole file you needed ten lines of costs you for the rest of the run.
+   Read a whole file only when you need all of it: a small file, or one you'll rewrite.
+   Large whole-file reads are cut at a line boundary, and the note says where to continue.
+2. **Check the issue's premises first.** If it builds on functions, files or behaviour
+   that don't exist in your checkout, don't invent them: make no changes and explain
+   what is missing. A wrong base or a stale issue is cheaper to fix than a second,
+   incompatible implementation.
+3. Make the smallest change that satisfies the issue's acceptance criteria. Don't
    refactor or "improve" code the issue didn't ask about.
-3. Add or update tests for the behaviour you changed, next to the existing tests.
-4. Run the repository's tests and type checks yourself, and fix what you broke.
-   Dependencies may need installing first (`npm ci` or the equivalent).
-5. Commit your work with conventional commit messages (`feat:`, `fix:`, `test:`, …).
+4. Add or update tests for the behaviour you changed, next to the existing tests.
+5. Run the checks listed under "This run" yourself, early and again before you
+   finish, and fix what fails. Dependencies may need installing first (`npm ci` or
+   the equivalent). Don't finish with a failing type check.
+6. Commit your work with conventional commit messages (`feat:`, `fix:`, `test:`, …).
    One commit is fine; several focused ones are better than one mixed one.
 
 ### Rules

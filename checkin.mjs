@@ -2,8 +2,8 @@
 //
 // With a `cruise_api_key` input the run never contacts wrok.in (enterprise, self-hosted
 // Cruise). Without one, it checks in: a GitHub OIDC token for audience `wrokin-agent`
-// goes to `POST /agent/checkin`, and the Builder card's Cruise key, lane and base URL
-// come back. That is the only call to wrok.in in a run. pi then calls Cruise directly.
+// goes to `POST /agent/checkin`, and the Builder card's Cruise key, lane, base URL,
+// read cap (#864) and base branch (#857) come back. That is the only call to wrok.in in a run. pi then calls Cruise directly.
 //
 // Check-in also returns a wrokin App token for this one repository (#817): contents,
 // pull requests and issues, never workflows. Every GitHub call in the run uses it, so
@@ -26,6 +26,7 @@ export function readInputs(env) {
     key: env.INPUT_CRUISE_API_KEY ?? "",
     model: env.INPUT_MODEL ?? "",
     baseUrl: env.INPUT_CRUISE_BASE_URL ?? "",
+    readCapKb: env.INPUT_READ_CAP_KB ?? "",
     apiBase: env.INPUT_WROKIN_API_BASE || "https://api.wrok.in",
     role: env.INPUT_ROLE || "builder",
   };
@@ -55,6 +56,12 @@ export async function requestOidc(env, audience, fetchFn = fetch) {
   return { oidc: data.value };
 }
 
+/**
+ * One line, for text from outside that ends up in an `::error` workflow command (and on
+ * the issue): a line break would end that command and start one of its own (PR #880).
+ */
+const oneLine = (s) => String(s).replace(/[\r\n]+/g, " ");
+
 /** The key comes back in the response, so wrok.in is only ever called over https. */
 function checkApiBase(apiBase) {
   try {
@@ -65,7 +72,7 @@ function checkApiBase(apiBase) {
   return "wrokin_api_base must be https.";
 }
 
-/** POST /agent/checkin → `{ key, model, baseUrl, githubToken }` or `{ error }` in words for the issue. */
+/** POST /agent/checkin → `{ key, model, baseUrl, readCapKb, baseBranch, githubToken }` or `{ error }` in words for the issue. */
 export async function checkin({ apiBase, oidc, role, fetchFn = fetch }) {
   const badBase = checkApiBase(apiBase);
   if (badBase) return { error: badBase };
@@ -77,13 +84,13 @@ export async function checkin({ apiBase, oidc, role, fetchFn = fetch }) {
       body: JSON.stringify({ oidc, role }),
     });
   } catch (err) {
-    return { error: `Could not reach wrok.in to fetch the Cruise key: ${err.message}` };
+    return { error: `Could not reach wrok.in to fetch the Cruise key: ${oneLine(err.message)}` };
   }
   const body = await res.json().catch(() => null);
   if (res.status !== 200) {
     // The server's refusals are written for the customer ("add a Cruise key on the
     // Builder card"), so they go on the issue as they are.
-    return { error: `wrok.in check-in refused (HTTP ${res.status}): ${body?.error ?? "no reason given"}.` };
+    return { error: `wrok.in check-in refused (HTTP ${res.status}): ${oneLine(body?.error ?? "no reason given")}.` };
   }
   if (typeof body?.cruise_api_key !== "string" || !body.cruise_api_key) {
     return { error: "wrok.in check-in answered without a Cruise key." };
@@ -92,6 +99,13 @@ export async function checkin({ apiBase, oidc, role, fetchFn = fetch }) {
     key: body.cruise_api_key,
     model: body.model ?? "",
     baseUrl: body.cruise_base_url ?? "",
+    // A whole number of KB, 0 = off. Absent from an older wrok.in, or not a whole
+    // number: empty, and read-cap.mjs applies its own default.
+    readCapKb: Number.isInteger(body.read_cap_kb) && body.read_cap_kb >= 0 ? String(body.read_cap_kb) : "",
+    // Null when the card leaves it automatic, and absent from an older wrok.in: empty, and
+    // the run works the base out itself. A `base_branch` input beats it in main.mjs, which
+    // keeps the two apart so the log can say which one chose.
+    baseBranch: typeof body.base_branch === "string" ? body.base_branch : "",
     // Absent from an older wrok.in: the run then falls back to the job's GITHUB_TOKEN.
     githubToken: typeof body.github_token === "string" ? body.github_token : "",
   };
@@ -105,23 +119,28 @@ export async function checkin({ apiBase, oidc, role, fetchFn = fetch }) {
 export async function resolve(env, { fetchFn = fetch, log = console.log } = {}) {
   const i = readInputs(env);
   if (i.key) {
-    return { model: i.model || DEFAULT_MODEL, baseUrl: i.baseUrl || DEFAULT_BASE_URL };
+    return { model: i.model || DEFAULT_MODEL, baseUrl: i.baseUrl || DEFAULT_BASE_URL, readCapKb: i.readCapKb, baseBranch: "" };
   }
   const tok = await requestOidc(env, AUDIENCE, fetchFn);
   if (tok.error) return { error: tok.error };
   const got = await checkin({ apiBase: i.apiBase, oidc: tok.oidc, role: i.role, fetchFn });
   if (got.error) return { error: got.error };
-  log(`::add-mask::${got.key}`);
-  if (got.githubToken) log(`::add-mask::${got.githubToken}`);
   const r = {
     key: got.key,
     githubToken: got.githubToken,
     model: i.model || got.model || DEFAULT_MODEL,
     baseUrl: i.baseUrl || got.baseUrl || DEFAULT_BASE_URL,
+    // "0" is an input too (off), so only an empty input defers to the card.
+    readCapKb: i.readCapKb !== "" ? i.readCapKb : got.readCapKb,
+    baseBranch: got.baseBranch,
   };
   // Each value becomes one `name=value` line in $GITHUB_OUTPUT; a line break would
-  // let a value write outputs of its own.
+  // let a value write outputs of its own. Checked before the masks too: `::add-mask::`
+  // is a workflow command, and a key with a line break in it would end it and start
+  // another (PR #880). Nothing has printed yet, and the error names no value.
   if (Object.values(r).some((v) => /[\r\n]/.test(v))) return { error: "wrok.in check-in answered with a malformed value." };
+  log(`::add-mask::${r.key}`);
+  if (r.githubToken) log(`::add-mask::${r.githubToken}`);
   return r;
 }
 
@@ -132,7 +151,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     recordSetupError(r.error);
     process.exit(1);
   }
-  const out = [`model=${r.model}`, `cruise_base_url=${r.baseUrl}`];
+  const out = [`model=${r.model}`, `cruise_base_url=${r.baseUrl}`, `read_cap_kb=${r.readCapKb}`, `card_base_branch=${r.baseBranch}`];
   if (r.key) out.push(`cruise_api_key=${r.key}`);
   if (r.githubToken) out.push(`github_token=${r.githubToken}`);
   appendFileSync(process.env.GITHUB_OUTPUT, `${out.join("\n")}\n`);

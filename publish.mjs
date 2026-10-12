@@ -4,6 +4,7 @@
 import { spawnSync } from "node:child_process";
 import { appendFileSync, copyFileSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { formatBytes, formatTopTools } from "./run-pi.mjs";
 
 export const UNVERIFIED_BANNER =
   "> ⚠️ **Authored, NOT proven to build.** The wrokin Builder could not verify this change " +
@@ -15,8 +16,18 @@ const CUTOFF_CODES = {
   budget_exhausted: "the Cruise project budget for this period is spent (`budget_exhausted`)",
 };
 
+/**
+ * The cutoff for a run pi didn't finish in time. It is a cutoff like a refusal: the
+ * work is partial however its tests come out (bytesbrains-cruise#611 ran out of time
+ * and left no summary).
+ */
+export const timeLimitCutoff = (minutes) => ({ code: "time_limit", message: `${minutes}-minute` });
+
 /** One sentence for why a run was cut off, from `summarize`'s `cutoff`. */
 export function cutoffReason(cutoff) {
+  if (cutoff.code === "time_limit") {
+    return `the agent reached the run's ${cutoff.message} time limit (\`timeout_minutes\`)`;
+  }
   if (CUTOFF_CODES[cutoff.code]) return CUTOFF_CODES[cutoff.code];
   const said = cutoff.message.replace(/\s+/g, " ").trim().slice(0, 300);
   return `a model call failed${cutoff.code ? ` (\`${cutoff.code}\`)` : ""}${said ? `: ${said}` : ""}`;
@@ -27,6 +38,26 @@ export function cutoffReason(cutoff) {
  * that happens to pass stays a draft: the agent never said it was done (#822).
  */
 export const isReady = (result, cutoff) => result.verified && !cutoff;
+
+/**
+ * Stamped as the LAST line of a ready PR's body (#839): `services/auto-merge.ts` merges
+ * only a wrokin[bot] PR on a `wrokin/builder/` branch that ends with it, so an opted-in
+ * repo's verified PR can merge itself. Keep the two copies identical (a backend test
+ * reads this file).
+ */
+export const VERIFIED_GREEN_MARKER = "<!-- wrokin-builder:verified-green -->";
+
+/**
+ * The body without any copy of the marker. The summary and the commit subjects are the
+ * agent's text, so the agent could write the marker itself, and a human readying that
+ * draft later would make it merge. Repeated until none is left: removing one copy can
+ * close up another around it.
+ */
+export function withoutMarker(text) {
+  let t = text;
+  while (t.includes(VERIFIED_GREEN_MARKER)) t = t.replaceAll(VERIFIED_GREEN_MARKER, "");
+  return t;
+}
 
 /**
  * A cut-off run gets this banner INSTEAD of the unverified one, not on top of it: two
@@ -196,6 +227,82 @@ export function saveAgentLogs({ workspace, to }) {
   return copied;
 }
 
+/**
+ * The branch's commit subjects and diffstat over `base`, read from the runner's bare
+ * copy (never the agent's checkout), for a summary the agent didn't write.
+ */
+export function describeCommits({ dir, base, branch, env, run = git }) {
+  const genv = runnerGitEnv(env);
+  const range = `${base}..refs/heads/${branch}`;
+  const log = run(["log", "--format=%s", range, "--"], { cwd: dir, env: genv });
+  const stat = run(["diff", "--stat=100", range, "--"], { cwd: dir, env: genv });
+  return {
+    subjects: log.code === 0 ? log.out.split("\n").filter(Boolean) : [],
+    stat: stat.code === 0 ? stat.out : "",
+  };
+}
+
+/**
+ * The files the checks read besides package.json's scripts (#870): the TypeScript and
+ * test-runner configs. `"strict": false` or an `exclude` turns a failing typecheck green
+ * without touching the script, so a run that changes one can't be called verified.
+ */
+export const CHECK_CONFIGS = [
+  "tsconfig*.json",
+  "jsconfig*.json",
+  "vitest.config.*",
+  "vitest.workspace.*",
+  "vite.config.*",
+  "jest.config.*",
+  ".mocharc*",
+  "karma.conf.*",
+  "ava.config.*",
+  "playwright.config.*",
+].map((f) => `:(glob)**/${f}`);
+
+/**
+ * The check configs the branch adds, changes or deletes over `base`, from the runner's
+ * copy. `--no-renames`: a config renamed away still shows, as the deletion it is.
+ */
+export function changedCheckConfigs({ dir, base, branch, env, run = git }) {
+  const r = run(["diff", "--name-only", "--no-renames", `${base}..refs/heads/${branch}`, "--", ...CHECK_CONFIGS], {
+    cwd: dir,
+    env: runnerGitEnv(env),
+  });
+  if (r.code !== 0) {
+    console.log(`::warning title=wrokin-agent check configs::git diff failed: ${r.out.slice(0, 300)}`);
+    return [];
+  }
+  return r.out.split("\n").filter(Boolean);
+}
+
+/** The proof-run's result once the agent's check-config changes are counted against it. */
+export function withConfigChanges(result, files) {
+  if (!files.length) return result;
+  const names = files.map((f) => `\`${f}\``).join(", ");
+  return { ...result, verified: false, reason: `${result.reason}; the agent changed ${names}, which the checks read` };
+}
+
+/**
+ * What the PR says when the agent wrote no summary (#855): what the branch holds and
+ * how far it got, so a reviewer never gets only "left no summary".
+ */
+export function generatedSummary({ commits, result, cutoff }) {
+  const why = cutoff ? `The agent wrote no summary: ${cutoffReason(cutoff)}.` : "The agent wrote no summary.";
+  const parts = [`_${why} This one is generated from the branch._`, ""];
+  // Fenced, not bulleted: subjects are the agent's text, and in a bullet a `## ` or a
+  // `<details>` in one would render as structure in a PR wrokin[bot] posts.
+  parts.push("**Commits**", "", commits.subjects.length ? fence(commits.subjects.slice(0, 30).join("\n")) : "(none listed)");
+  if (commits.stat) parts.push("", "**Files changed**", "", fence(commits.stat.split("\n").slice(-40).join("\n")));
+  parts.push(
+    "",
+    `**Checks:** ${result.verified ? "the proof-run below passed" : `the proof-run below did not pass: ${result.reason}`}.`,
+    "",
+    "**Open assumptions:** the agent stated none. Review the diff against the issue's premises.",
+  );
+  return parts.join("\n");
+}
+
 /** Pushes `ref` to `branch` with Basic auth (git's HTTP transport 401s a Bearer token). */
 export function pushBranch({ cwd, env, repo, branch, token, ref = "HEAD", run = git }) {
   const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
@@ -213,31 +320,129 @@ export function pushBranch({ cwd, env, repo, branch, token, ref = "HEAD", run = 
 
 const fence = (s) => `\`\`\`\n${s.replaceAll("```", "``​`")}\n\`\`\``;
 
-export function prBody({ issue, summary, result, runUrl, model, usage, cutoff = null }) {
+/**
+ * How the run was set up (#855): the base and why, the guideline files it was given,
+ * the checks, and any name the issue uses that the base doesn't have.
+ */
+function setupSection(setup) {
+  const lines = [
+    `- **Base:** \`${setup.base.branch}\` (${setup.base.why})`,
+    `- **Guidelines given to the agent:** ${setup.guidelines.length ? setup.guidelines.map((g) => `\`${g}\``).join(", ") : "none found"}`,
+    `- **Checks:** ${[setup.checks.typecheck, setup.checks.test].filter(Boolean).map((c) => `\`${c}\``).join(", ") || "none found"}`,
+  ];
+  if (setup.changedConfigs?.length) {
+    lines.push(`- **Check config changed in this run:** ${setup.changedConfigs.map((f) => `\`${f}\``).join(", ")} (so the PR is a draft)`);
+  }
+  if (setup.premises.missing.length) {
+    lines.push(`- **Named in the issue, not on the base:** ${setup.premises.missing.map((m) => `\`${m}\``).join(", ")}`);
+  }
+  return ["## Run setup", "", ...lines, ""];
+}
+
+export function prBody({ issue, summary, result, runUrl, model, usage, cutoff = null, setup = null, fallback = null }) {
   const parts = [];
   if (cutoff) parts.push(cutoffBanner(cutoff, result.verified), "");
   else if (!result.verified) parts.push(UNVERIFIED_BANNER, "");
   parts.push(`Closes #${issue}`, "");
-  const noSummary = cutoff ? "_The agent was cut off before it wrote one._" : "_The agent left no summary._";
+  const noSummary = fallback ?? (cutoff ? "_The agent was cut off before it wrote one._" : "_The agent left no summary._");
   parts.push("## What the agent says it did", "", summary?.trim() || noSummary, "");
+  if (setup) parts.push(...setupSection(setup));
   parts.push("## Proof-run", "");
   if (result.proof) {
     parts.push(
       `Run by the action after the agent exited, not by the agent: **${result.reason}**.`,
       "",
-      fence(`$ ${result.proof.cmd}\nexit ${result.proof.exitCode}\n…\n${result.proof.tail.slice(-2500)}`),
+      fence(
+        (result.proof.before ?? []).map((b) => `$ ${b.cmd}\nexit ${b.exitCode}\n\n`).join("") +
+          `$ ${result.proof.cmd}\nexit ${result.proof.exitCode}\n…\n${result.proof.tail.slice(-2500)}`,
+      ),
     );
   } else {
     parts.push(`No proof-run: ${result.reason}.`);
   }
+  const top = formatTopTools(usage?.tools);
+  const extra = [];
+  if (top) extra.push(top);
+  if (usage?.failedEdits) extra.push(`${usage.failedEdits} failed edit${usage.failedEdits === 1 ? "" : "s"}`);
+  if (usage?.gateRounds) extra.push(`${usage.gateRounds} gate round${usage.gateRounds === 1 ? "" : "s"}`);
+  if (usage?.cappedReads) extra.push(`${usage.cappedReads} capped read${usage.cappedReads === 1 ? "" : "s"}`);
+
   parts.push(
     "",
     `<sub>wrokin Builder · ${model} via Cruise · ${usage.input} in` +
       (usage.cached ? ` + ${usage.cached} cached` : "") +
       ` / ${usage.output} out tokens · ` +
-      `${usage.toolCalls} tool calls · [run](${runUrl})</sub>`,
+      `${usage.toolCalls} tool calls` +
+      (extra.length ? ` · ${extra.join(" · ")}` : "") +
+      ` · [run](${runUrl})</sub>`,
   );
+  const body = withoutMarker(parts.join("\n"));
+  return isReady(result, cutoff) ? `${body}\n${VERIFIED_GREEN_MARKER}` : body;
+}
+
+/**
+ * Builds the markdown table for the GitHub Actions job summary (#860): quality
+ * guardrails, full tool breakdown by result bytes, and Cruise compression mapping.
+ */
+export function buildJobSummary({ summary = {}, result = null, ready = false, runId = "", model = "" }) {
+  const parts = [];
+  parts.push("### wrokin Builder — Context Budget & Quality Guardrails", "");
+
+  parts.push("#### Quality guardrails", "");
+  parts.push("| Signal | Value |");
+  parts.push("| --- | --- |");
+  if (result) {
+    parts.push(`| Proof-run | ${result.verified ? "✅ passed" : `⚠️ not verified: ${result.reason}`} |`);
+    parts.push(`| PR status | ${ready ? "ready" : "draft"} |`);
+  }
+  parts.push(`| In-loop gate rounds | ${summary.gateRounds ?? 0} |`);
+  parts.push(`| Failed edit calls | ${summary.failedEdits ?? 0} |`);
+  parts.push(`| Capped whole-file reads | ${summary.cappedReads ?? 0} |`);
+  parts.push(`| Total tool calls | ${summary.toolCalls ?? 0} |`);
+  const inputStr = summary.cached
+    ? `${summary.input ?? 0} (+ ${summary.cached} cached)`
+    : `${summary.input ?? 0}`;
+  parts.push(`| Input tokens | ${inputStr} |`);
+  parts.push(`| Output tokens | ${summary.output ?? 0} |`);
+  parts.push("");
+
+  parts.push("#### Tool breakdown", "");
+  const toolEntries = Object.entries(summary.tools ?? {}).sort(
+    (a, b) => (b[1].bytes ?? 0) - (a[1].bytes ?? 0) || (b[1].calls ?? 0) - (a[1].calls ?? 0),
+  );
+  if (toolEntries.length) {
+    parts.push("| Tool | Calls | Result bytes |");
+    parts.push("| --- | --- | --- |");
+    for (const [name, stats] of toolEntries) {
+      parts.push(`| \`${name}\` | ${stats.calls ?? 0} | ${formatBytes(stats.bytes ?? 0)} |`);
+    }
+  } else {
+    parts.push("_No tool calls recorded._");
+  }
+  parts.push("");
+
+  parts.push("#### Cruise compression", "");
+  parts.push(`- **Session:** \`wrokin-${runId}\` (sent via \`x-cruise-session\`)`);
+  parts.push(
+    "- **Ledger mapping:** Cruise records `compress_bytes_before` and `compress_bytes_after` per request. " +
+      "Session-keyed ledger queries/reporting are tracked in [bytesbrains/bytesbrains-cruise#617](https://github.com/bytesbrains/bytesbrains-cruise/issues/617).",
+  );
+  parts.push("");
+
   return parts.join("\n");
+}
+
+/**
+ * Appends summary markdown to $GITHUB_STEP_SUMMARY if configured. Returns true if written.
+ */
+export function recordJobSummary(summaryContent, summaryPath = process.env.GITHUB_STEP_SUMMARY) {
+  if (!summaryPath) return false;
+  try {
+    appendFileSync(summaryPath, summaryContent + "\n");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -103,7 +103,7 @@ describe("preflight", () => {
 });
 
 // #822: the #667 run started with $0.27 and was refused on call 49. Cruise sends these
-// headers on /v1/models once bytesbrains/bytesbrains-cruise#584 lands; until then, none.
+// headers on /v1/models since bytesbrains/bytesbrains-cruise#584 (2026-10-09, #871).
 describe("checkWallet", () => {
   const h = (o) => new Headers(o);
 
@@ -150,6 +150,23 @@ describe("preflight: wallet", () => {
     });
     expect(why).toBeNull();
     expect(warnings).toEqual(["The Cruise wallet is low ($0.50 left). A long run may be cut off partway with wallet_exhausted."]);
+  });
+
+  // #871: no wallet header means no wallet at tenant scope, not an error.
+  it("goes ahead, silently, when Cruise sends no wallet headers", async () => {
+    const warnings = [];
+    const why = await preflight({ ...base, fetchFn: reply({}), warn: (w) => warnings.push(w) });
+    expect(why).toBeNull();
+    expect(warnings).toEqual([]);
+  });
+
+  // The shape production sent on 2026-10-09: a capped wallet with room to spare.
+  it("goes ahead, silently, on a healthy capped wallet", async () => {
+    const warnings = [];
+    const headers = { "x-cruise-wallet-state": "ok", "x-cruise-wallet-balance": "4.1490", "x-cruise-budget-state": "ok" };
+    const why = await preflight({ ...base, fetchFn: reply(headers), warn: (w) => warnings.push(w) });
+    expect(why).toBeNull();
+    expect(warnings).toEqual([]);
   });
 
   it("names a bad model before the wallet", async () => {

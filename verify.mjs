@@ -1,7 +1,7 @@
 // The independent check (#805): after pi exits, the action runs the repo's tests itself.
 // pi saying "tests pass" is a claim; this is the evidence that decides ready vs draft.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Install from the lockfile, as the old Builder did (#737). Null: nothing to install. */
@@ -41,6 +41,26 @@ export function testCommand(dir, override, read = (f) => readFileSync(f, "utf8")
   return null;
 }
 
+/** The repo's package.json scripts, or {}: a regular file only, never followed through a link. */
+export function packageScripts(dir) {
+  try {
+    if (!lstatSync(join(dir, "package.json")).isFile()) return {};
+    const scripts = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"))?.scripts;
+    return scripts && typeof scripts === "object" ? scripts : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The check scripts whose body differs from the base's (#858 review). `npm run
+ * typecheck` is fixed before the run, but the script it runs lives in package.json,
+ * which the agent can edit: `"typecheck": "true"` would pass both gates.
+ */
+export function changedScripts(dir, before = {}, now = packageScripts(dir)) {
+  return Object.keys(before).filter((name) => now[name] !== before[name]);
+}
+
 /** Runs one shell command with a time limit; keeps the tail of its output. */
 export function sh(cmd, { cwd, env, timeoutMs, spawnFn = spawn }) {
   return new Promise((resolve) => {
@@ -68,16 +88,35 @@ export function sh(cmd, { cwd, env, timeoutMs, spawnFn = spawn }) {
 }
 
 /**
- * Installs, then tests. `verified` only when a real test command ran and exited 0.
- * The proof-run is what goes into the PR, so it records what actually ran.
+ * Installs, type-checks, then tests. `verified` only when a real test command ran and
+ * exited 0, after the typecheck (when there is one) passed. The proof-run is what goes
+ * into the PR, so it records what actually ran. `typecheck` and `test` are found on the
+ * base before the agent runs (#855, #870), so the agent can't drop a check by editing
+ * package.json, nor supply its own: a test script the base didn't have still runs and is
+ * reported, but can't make the result verified. A typecheck that passed rides along in
+ * `proof.before`, so the PR shows it ran and not only the test that followed (#840).
  */
-export async function verify({ dir, override, env, timeoutMs, run = sh, now = Date.now }) {
-  const test = testCommand(dir, override);
+export async function verify({ dir, override, env, timeoutMs, typecheck = null, test: baseTest = null, scripts = {}, run = sh, now = Date.now }) {
+  const fixed = override?.trim() || baseTest;
+  const added = fixed ? null : testCommand(dir);
+  const test = fixed || added;
   if (!test) return { verified: false, reason: "no test command found", proof: null };
+  const note = added ? "; the test script was added in this run, so it can't verify the change" : "";
+  const changed = changedScripts(dir, scripts);
+  if (changed.length) {
+    return {
+      verified: false,
+      reason: `the agent changed the ${changed.map((n) => `\`${n}\``).join(" and ")} script in package.json, so the checks prove nothing`,
+      proof: null,
+    };
+  }
   // One deadline for install and test together: the test gets what install left.
   const deadline = now() + timeoutMs;
   const install = installCommand(dir);
+  // Named in a budget message: the step that used the time, never one that didn't run.
+  let last = null;
   if (install) {
+    last = install;
     const r = await run(install, { cwd: dir, env, timeoutMs });
     if (r.code !== 0) {
       return {
@@ -87,10 +126,29 @@ export async function verify({ dir, override, env, timeoutMs, run = sh, now = Da
       };
     }
   }
+  const spent = () => ({
+    verified: false,
+    reason: `${last ? `\`${last}\`` : "setup"} used the whole verify budget`,
+    proof: null,
+  });
+  if (deadline - now() <= 0) return spent();
+  const before = [];
+  if (typecheck) {
+    last = typecheck;
+    const r = await run(typecheck, { cwd: dir, env, timeoutMs: deadline - now() });
+    if (r.code !== 0) {
+      return {
+        verified: false,
+        reason: r.timedOut ? `\`${typecheck}\` timed out` : `\`${typecheck}\` failed (exit ${r.code})`,
+        proof: { cmd: typecheck, exitCode: r.code, tail: r.tail },
+      };
+    }
+    before.push({ cmd: typecheck, exitCode: r.code });
+  }
   const left = deadline - now();
-  if (left <= 0) return { verified: false, reason: `\`${install}\` used the whole verify budget`, proof: null };
+  if (left <= 0) return spent();
   const r = await run(test, { cwd: dir, env, timeoutMs: left });
-  const proof = { cmd: test, exitCode: r.code, tail: r.tail };
-  if (r.code === 0) return { verified: true, reason: "tests passed", proof };
-  return { verified: false, reason: r.timedOut ? `\`${test}\` timed out` : `\`${test}\` failed (exit ${r.code})`, proof };
+  const proof = { cmd: test, exitCode: r.code, tail: r.tail, ...(before.length ? { before } : {}) };
+  if (r.code === 0) return { verified: !added, reason: `tests passed${note}`, proof };
+  return { verified: false, reason: `${r.timedOut ? `\`${test}\` timed out` : `\`${test}\` failed (exit ${r.code})`}${note}`, proof };
 }

@@ -38,7 +38,11 @@ inputs:
     required: false
     default: ""
   base_branch:
-    description: "Branch the PR targets. Defaults to the branch the workflow ran on."
+    description: "Branch the work starts from and the PR targets; set, it wins over everything below, the Builder card included. Empty: the Builder card's base branch, else what the repo's AGENTS.md/CLAUDE.md/CONTRIBUTING.md say PRs target, else the branch most recent merged feature PRs target (at least 3 of them), else the repo's default branch."
+    required: false
+    default: ""
+  read_cap_kb:
+    description: "Soft cap, in KB, on a whole-file read: a read that passes neither offset nor limit and returns more is cut at a line boundary, with a note saying where to continue. 0 turns it off. Empty: the Builder card's setting, else 24."
     required: false
     default: ""
   timeout_minutes:
@@ -90,7 +94,7 @@ runs:
         dir="$RUNNER_TEMP/wrokin-agent-src"
         rm -rf "$dir" && cp -R "$GITHUB_ACTION_PATH" "$dir"
         echo "dir=$dir" >> "$GITHUB_OUTPUT"
-    # Key, model and base URL, once. With no cruise_api_key input this is the run's one
+    # Key, model, base URL, read cap and base branch, once. With no cruise_api_key input this is the run's one
     # call to wrok.in, and the key is masked before anything else prints (#813). It also
     # returns this run's wrokin App token for GitHub (#817), masked the same way.
     - id: creds
@@ -101,6 +105,7 @@ runs:
         INPUT_CRUISE_BASE_URL: ${{ inputs.cruise_base_url }}
         INPUT_WROKIN_API_BASE: ${{ inputs.wrokin_api_base }}
         INPUT_ROLE: ${{ inputs.role }}
+        INPUT_READ_CAP_KB: ${{ inputs.read_cap_kb }}
       run: node "${{ steps.src.outputs.dir }}/checkin.mjs"
     - id: preflight
       shell: bash
@@ -124,7 +129,9 @@ runs:
         INPUT_GITHUB_TOKEN: ${{ steps.creds.outputs.github_token || inputs.github_token }}
         INPUT_TEST_COMMAND: ${{ inputs.test_command }}
         INPUT_BASE_BRANCH: ${{ inputs.base_branch }}
+        INPUT_CARD_BASE_BRANCH: ${{ steps.creds.outputs.card_base_branch }}
         INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        INPUT_READ_CAP_KB: ${{ steps.creds.outputs.read_cap_kb }}
         INPUT_PI: ${{ steps.setup.outputs.pi }}
         INPUT_AGENT_DIR: ${{ steps.setup.outputs.agent_dir }}
       run: node "${{ steps.src.outputs.dir }}/main.mjs"

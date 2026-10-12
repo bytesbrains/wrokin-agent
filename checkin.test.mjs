@@ -23,14 +23,14 @@ describe("resolve (#813)", () => {
     const fetchFn = vi.fn();
     const r = await resolve({ INPUT_CRUISE_API_KEY: KEY, ...OIDC_ENV }, { fetchFn });
     expect(fetchFn).not.toHaveBeenCalled();
-    expect(r).toEqual({ model: "bb/builder", baseUrl: "https://cruise.bytesbrains.net/v1" });
+    expect(r).toEqual({ model: "bb/builder", baseUrl: "https://cruise.bytesbrains.net/v1", readCapKb: "", baseBranch: "" });
   });
 
   it("fetches the card's key, lane and URL, and masks the key before returning it", async () => {
     const fetchFn = fakeFetch();
     const log = vi.fn();
     const r = await resolve({ ...OIDC_ENV }, { fetchFn, log });
-    expect(r).toEqual({ key: KEY, githubToken: GH, model: "bb/builder-fast", baseUrl: "https://cruise.example/v1" });
+    expect(r).toEqual({ key: KEY, githubToken: GH, model: "bb/builder-fast", baseUrl: "https://cruise.example/v1", readCapKb: "", baseBranch: "" });
     expect(log).toHaveBeenCalledWith(`::add-mask::${KEY}`);
 
     const [oidcUrl, oidcInit] = fetchFn.mock.calls[0];
@@ -47,6 +47,34 @@ describe("resolve (#813)", () => {
       { fetchFn: fakeFetch(), log: () => {} },
     );
     expect(r).toMatchObject({ model: "mistral/codestral-2508", baseUrl: "https://mine/v1" });
+  });
+
+  // #864: input over card over read-cap.mjs's default, and "0" (off) is a value, not "unset".
+  it("takes the card's read cap unless the workflow sets one", async () => {
+    const card = (read_cap_kb) => fakeFetch(200, { cruise_api_key: KEY, read_cap_kb });
+    const cap = async (env, fetchFn) => (await resolve({ ...OIDC_ENV, ...env }, { fetchFn, log: () => {} })).readCapKb;
+    expect(await cap({}, card(8))).toBe("8");
+    expect(await cap({}, card(0))).toBe("0");
+    expect(await cap({ INPUT_READ_CAP_KB: "0" }, card(8))).toBe("0");
+    expect(await cap({ INPUT_READ_CAP_KB: "32" }, card(8))).toBe("32");
+    // An older wrok.in, or a value that isn't a whole number: read-cap.mjs's default.
+    expect(await cap({}, card(undefined))).toBe("");
+    expect(await cap({}, card("8\nx=y"))).toBe("");
+    expect(await cap({}, card(-1))).toBe("");
+    expect(await cap({ INPUT_CRUISE_API_KEY: KEY, INPUT_READ_CAP_KB: "16" }, vi.fn())).toBe("16");
+  });
+
+  // #857: passed through as its own value; main.mjs puts the base_branch input first.
+  it("takes the card's base branch, and empty when the card leaves it automatic", async () => {
+    const card = (base_branch) => fakeFetch(200, { cruise_api_key: KEY, base_branch });
+    const base = async (env, fetchFn) => (await resolve({ ...OIDC_ENV, ...env }, { fetchFn, log: () => {} })).baseBranch;
+    expect(await base({}, card("dev"))).toBe("dev");
+    expect(await base({}, card(null))).toBe("");
+    expect(await base({}, card(undefined))).toBe("");
+    expect(await base({}, card(7))).toBe("");
+    // A line break would write an output of its own: the whole check-in is refused.
+    expect((await resolve({ ...OIDC_ENV }, { fetchFn: card("dev\ncruise_api_key=x"), log: () => {} })).error).toMatch(/malformed/);
+    expect(await base({ INPUT_CRUISE_API_KEY: KEY }, vi.fn())).toBe("");
   });
 
   it("falls back to the default lane when the card names none", async () => {
@@ -91,6 +119,28 @@ describe("resolve: the run's GitHub token (#817)", () => {
       { fetchFn: fakeFetch(200, { cruise_api_key: KEY, github_token: `${GH}\ncruise_api_key=x` }), log: () => {} },
     );
     expect(r.error).toMatch(/malformed/);
+  });
+
+  // PR #880 review: `::add-mask::` is a workflow command too. A line break in a secret
+  // would end it and start a command of the response's choosing, so nothing is logged.
+  it("logs no mask command for a secret with a line break in it", async () => {
+    for (const body of [
+      { cruise_api_key: `${KEY}\n::stop-commands::x` },
+      { cruise_api_key: KEY, github_token: `${GH}\r\n::warning::x` },
+    ]) {
+      const log = vi.fn();
+      const r = await resolve({ ...OIDC_ENV }, { fetchFn: fakeFetch(200, body), log });
+      expect(r.error).toMatch(/malformed/);
+      expect(log).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps a refusal from wrok.in to one line, since it goes into an ::error command", async () => {
+    const r = await resolve(
+      { ...OIDC_ENV },
+      { fetchFn: fakeFetch(409, { error: "add a Cruise key\n::warning::injected\r\nmore" }), log: () => {} },
+    );
+    expect(r.error).toBe("wrok.in check-in refused (HTTP 409): add a Cruise key ::warning::injected more.");
   });
 
   it("never puts the GitHub token in an error", async () => {
@@ -153,7 +203,7 @@ describe("checkin", () => {
 
 describe("readInputs (#814 review)", () => {
   it("defaults the API base and role, and treats unset inputs as empty", () => {
-    expect(readInputs({})).toEqual({ key: "", model: "", baseUrl: "", apiBase: "https://api.wrok.in", role: "builder" });
+    expect(readInputs({})).toEqual({ key: "", model: "", baseUrl: "", readCapKb: "", apiBase: "https://api.wrok.in", role: "builder" });
   });
 
   it("checks in at a wrokin_api_base override", async () => {

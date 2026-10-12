@@ -1,4 +1,8 @@
 import { describe, it, expect } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { main, readInputs, verifyBudget } from "./main.mjs";
 
 const env = (over = {}) => ({
@@ -35,6 +39,7 @@ describe("readInputs", () => {
     expect(i).toMatchObject({ role: "builder", issue: 5, timeoutMs: 30 * 60_000, runUrl: "https://github.com/o/r/actions/runs/9", temp: "/rt/wrokin-agent" });
     expect(readInputs(env({ INPUT_TIMEOUT_MINUTES: "-3" })).timeoutMs).toBe(30 * 60_000);
     expect(readInputs(env({ INPUT_TIMEOUT_MINUTES: "45" })).timeoutMs).toBe(45 * 60_000);
+    expect(readInputs(env({ INPUT_TIMEOUT_MINUTES: "nope" }))).toMatchObject({ minutes: 30, timeoutMs: 30 * 60_000 });
   });
 });
 
@@ -65,5 +70,46 @@ describe("main: early outcomes", () => {
     const gh = fakeGh({ ok: true, status: 200, data: {} });
     await main(env({ INPUT_ISSUE_NUMBER: "" }), gh);
     expect(gh.comments).toEqual([]);
+  });
+});
+
+// #858 review: the premise stop wired through main(), not just premiseStop() alone. It
+// returns before the checkout is handed to the agent's user, so nothing here needs sudo.
+describe("main: premise stop", () => {
+  it("reads the base from the repo's docs and stops on a wrong-base issue, with no PR", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wrokin-main-"));
+    const ws = join(root, "ws");
+    mkdirSync(join(root, "agent"), { recursive: true });
+    mkdirSync(ws);
+    const g = (...a) => spawnSync("git", a, { cwd: ws, encoding: "utf8" });
+    g("init", "-q", "-b", "main");
+    writeFileSync(join(ws, "CLAUDE.md"), "Open PRs against `main`.\n");
+    g("add", "-A");
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base");
+    const issue = {
+      number: 5,
+      title: "Extend compression",
+      labels: [],
+      body: "Extend `decideCompression` in `src/compress-policy.ts`, documented in `docs/compression.md`.",
+    };
+    const posted = [];
+    const gh = {
+      async call(method, path, body) {
+        if (method === "POST") return posted.push({ path, body: body.body }), { ok: true, status: 201, data: {} };
+        if (path === "/repos/o/r/issues/5") return { ok: true, status: 200, data: issue };
+        if (path === "/repos/o/r") return { ok: true, status: 200, data: { default_branch: "main" } };
+        return { ok: true, status: 200, data: [] };
+      },
+      async all() {
+        return { ok: true, items: [] };
+      },
+    };
+    await main(env({ GITHUB_WORKSPACE: ws, RUNNER_TEMP: root, INPUT_AGENT_DIR: join(root, "agent"), GITHUB_REF_NAME: "main", PATH: process.env.PATH }), gh);
+    rmSync(root, { recursive: true, force: true });
+    expect(posted).toHaveLength(1);
+    expect(posted[0].path).toBe("/repos/o/r/issues/5/comments");
+    expect(posted[0].body).toContain("isn't on `main` (`CLAUDE.md` says so)");
+    expect(posted[0].body).toContain("(3 of the 3 names the issue gives)");
+    expect(posted.some((p) => p.path.endsWith("/pulls"))).toBe(false);
   });
 });

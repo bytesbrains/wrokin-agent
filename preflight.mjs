@@ -33,10 +33,14 @@ export function checkModel(status, body, model) {
 export const LOW_BALANCE_USD = 1;
 
 /**
- * The wallet, from Cruise's `x-cruise-wallet-*` headers: `{ problem, warning }`.
- * Cruise sends them on chat responses; on /v1/models only once
- * bytesbrains/bytesbrains-cruise#584 lands. Without them this says nothing, so it is
- * safe to ship first.
+ * The wallet, from Cruise's `x-cruise-wallet-*` headers on /v1/models: `{ problem, warning }`
+ * (bytesbrains/bytesbrains-cruise#584, live since 2026-10-09; #871). It branches on
+ * the state. `exhausted` refuses, because a run started anyway is cut off partway
+ * (#822). No header means the tenant has no wallet, so the run goes ahead. The
+ * balance only sharpens a warning, never a refusal. One call can hold more than a
+ * positive balance, so no number can promise a run will finish. Until a wallet has
+ * a low-water mark (bytesbrains-cruise#583) Cruise says `ok` right up to `exhausted`,
+ * so the floor is what warns in that gap.
  */
 export function checkWallet(headers) {
   const state = headers?.get?.("x-cruise-wallet-state") ?? null;

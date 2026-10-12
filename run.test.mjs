@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { modelsJson, piEnv, scrubbedEnv, wantsThinkingSwitch } from "./pi-config.mjs";
-import { errorCode, piArgs, summarize } from "./run-pi.mjs";
+import { errorCode, formatBytes, formatTopTools, piArgs, summarize, toolBytes } from "./run-pi.mjs";
 import { client, fetchIssue, taskMarkdown } from "./github.mjs";
 import { failureComment } from "./report-failure.mjs";
 
@@ -74,11 +74,55 @@ describe("scrubbedEnv: toolchains", () => {
 });
 
 describe("piArgs", () => {
+  it("loads the action's own extensions explicitly, before the prompt (#857)", () => {
+    const a = piArgs({ model: "m", rolePrompt: "/r.md", taskFile: "/t.md", thinking: false, extensions: ["/act/check-gate.mjs"] });
+    expect(a.slice(a.indexOf("-e"), a.indexOf("-e") + 2)).toEqual(["-e", "/act/check-gate.mjs"]);
+    expect(a.indexOf("-e")).toBeLessThan(a.indexOf("@/t.md"));
+    expect(piArgs({ model: "m", rolePrompt: "/r.md", taskFile: "/t.md", thinking: false })).not.toContain("-e");
+  });
+
   it("runs non-interactively, untrusting the repo's .pi config", () => {
     const a = piArgs({ model: "bb/builder", rolePrompt: "/r.md", taskFile: "/t.md", thinking: true });
     expect(a).toEqual(expect.arrayContaining(["--no-session", "--no-approve", "--mode", "json", "@/t.md"]));
     expect(a.slice(a.indexOf("--thinking"), a.indexOf("--thinking") + 2)).toEqual(["--thinking", "off"]);
     expect(piArgs({ model: "m", rolePrompt: "r", taskFile: "t", thinking: false })).not.toContain("--thinking");
+  });
+});
+
+describe("toolBytes & formatBytes (#860)", () => {
+  it("measures the content pi sends the model: text and image blocks, not details", () => {
+    expect(toolBytes(null)).toBe(0);
+    expect(toolBytes(undefined)).toBe(0);
+    expect(toolBytes({ content: [{ type: "text", text: "foo" }, { type: "text", text: "bar" }] })).toBe(6);
+    expect(toolBytes({ content: [{ type: "text", text: "é" }] })).toBe(2);
+    expect(toolBytes({ content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }] })).toBe(8);
+    expect(toolBytes({ content: [{ type: "text", text: "ok" }], details: { diff: "x".repeat(5000) } })).toBe(2);
+    // Shapes pi never emits measure as nothing rather than as a guess.
+    expect(toolBytes("hello")).toBe(0);
+    expect(toolBytes({ content: "defg" })).toBe(0);
+  });
+
+  it("formats bytes compactly", () => {
+    expect(formatBytes(0)).toBe("0 KB");
+    expect(formatBytes(-1)).toBe("0 KB");
+    expect(formatBytes(500)).toBe("<1 KB");
+    expect(formatBytes(412 * 1024)).toBe("412 KB");
+    expect(formatBytes(61 * 1024)).toBe("61 KB");
+    expect(formatBytes(9 * 1024)).toBe("9 KB");
+    expect(formatBytes(1.5 * 1024 * 1024)).toBe("1.5 MB");
+    expect(formatBytes(10 * 1024 * 1024)).toBe("10 MB");
+  });
+
+  it("formats top tools sorted by bytes descending", () => {
+    const tools = {
+      read: { calls: 10, bytes: 412 * 1024 },
+      bash: { calls: 5, bytes: 61 * 1024 },
+      grep: { calls: 2, bytes: 9 * 1024 },
+      find: { calls: 1, bytes: 2 * 1024 },
+    };
+    expect(formatTopTools(tools, 3)).toBe("read 412 KB · bash 61 KB · grep 9 KB");
+    expect(formatTopTools({})).toBe("");
+    expect(formatTopTools({ read: { calls: 1, bytes: 0 } })).toBe("read 0 KB");
   });
 });
 
@@ -104,7 +148,60 @@ describe("summarize", () => {
       output: 7,
       errors: ["401: bad key"],
       cutoff: { message: "401: bad key", code: null },
+      tools: {
+        bash: { calls: 1, bytes: 0 },
+        edit: { calls: 1, bytes: 0 },
+      },
+      failedEdits: 1,
+      gateRounds: 0,
+      cappedReads: 0,
     });
+  });
+
+  // #860: per-tool counts and bytes, failed edits, gate rounds on a fixture stream
+  it("records per-tool { calls, bytes }, failed edits and gate rounds from a fixture stream", () => {
+    const jsonl = [
+      ev({ type: "session", id: "s1" }),
+      ev({ type: "tool_execution_end", toolName: "read", result: { content: [{ type: "text", text: "x".repeat(412 * 1024) }] }, isError: false }),
+      ev({ type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "b".repeat(61 * 1024) }] }, isError: false }),
+      ev({ type: "tool_execution_end", toolName: "grep", result: { content: [{ type: "text", text: "g".repeat(9 * 1024) }] }, isError: false }),
+      ev({ type: "tool_execution_end", toolName: "edit", result: { content: [{ type: "text", text: "could not match text" }] }, isError: true }),
+      ev({ type: "tool_execution_end", toolName: "edit", result: { content: [{ type: "text", text: "e".repeat(1024) }] }, isError: false }),
+      ev({ type: "tool_execution_end", toolName: "read", result: { content: [{ type: "text", text: "c".repeat(1024) }], details: { wrokinReadCap: { cap: 1024 } } }, isError: false }),
+      ev({
+        type: "entry_appended",
+        entry: { type: "custom_message", customType: "wrokin-check-gate", content: "typecheck failed round 1", display: true },
+      }),
+      ev({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done" }], usage: { input: 100, output: 20 } } }),
+    ].join("\n");
+    const s = summarize(jsonl);
+    expect(s.tools).toEqual({
+      read: { calls: 2, bytes: 413 * 1024 },
+      bash: { calls: 1, bytes: 61 * 1024 },
+      grep: { calls: 1, bytes: 9 * 1024 },
+      edit: { calls: 2, bytes: Buffer.byteLength("could not match text") + 1024 },
+    });
+    expect(s.failedEdits).toBe(1);
+    expect(s.gateRounds).toBe(1);
+    expect(s.cappedReads).toBe(1); // #861
+    expect(formatTopTools(s.tools, 3)).toBe("read 413 KB · bash 61 KB · grep 9 KB");
+    // Invariant: no content is recorded, only counts and sizes (#860)
+    for (const [name, stats] of Object.entries(s.tools)) {
+      expect(Object.keys(stats)).toEqual(["calls", "bytes"]);
+    }
+  });
+
+  // #870: pi 1.0.4 carries the gate's hand-back only as `entry_appended`; the other
+  // shapes were speculative and must not count, or a future echo would double-count.
+  it("counts gate rounds from entry_appended only", () => {
+    const entry = { type: "custom_message", customType: "wrokin-check-gate", content: "x", display: true };
+    const jsonl = [
+      ev({ type: "entry_appended", entry }),
+      ev({ type: "entry_appended", entry }),
+      ev({ type: "custom_message", customType: "wrokin-check-gate" }),
+      ev({ type: "message_end", message: { role: "custom", customType: "wrokin-check-gate", content: "x" } }),
+    ].join("\n");
+    expect(summarize(jsonl).gateRounds).toBe(2);
   });
 
   // #822: the #667 run's last call, verbatim in shape. pi exits 0 after it, so this is

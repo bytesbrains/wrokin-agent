@@ -6,17 +6,24 @@ import { join } from "node:path";
 import {
   AGENT_LOG_DIRS,
   UNVERIFIED_BANNER,
+  VERIFIED_GREEN_MARKER,
+  buildJobSummary,
   cutoffReason,
   excludeAgentLogs,
   isReady,
   branchName,
   collectCommits,
+  describeCommits,
   dropCheckoutCredentials,
   finalizeCommits,
+  generatedSummary,
   openPr,
   prBody,
   pushBranch,
+  recordJobSummary,
   saveAgentLogs,
+  timeLimitCutoff,
+  withoutMarker,
 } from "./publish.mjs";
 import { installCommand, testCommand, verify } from "./verify.mjs";
 
@@ -95,6 +102,105 @@ describe("verify: budget", () => {
     rmSync(dir, { recursive: true, force: true });
     expect(r).toEqual({ verified: false, reason: "`npm ci` used the whole verify budget", proof: null });
   });
+
+  // #856 review: the message names the step that used the time, never `null`.
+  it("names the typecheck, or setup, as what used the budget", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wrokin-agent-budget-"));
+    let t = 0;
+    const slow = async () => ((t += 1000), { code: 0, tail: "" });
+    const tc = await verify({ dir, override: "npm test", env: {}, timeoutMs: 1000, typecheck: "npm run typecheck", run: slow, now: () => t });
+    expect(tc.reason).toBe("`npm run typecheck` used the whole verify budget");
+    t = 0;
+    const none = await verify({ dir, override: "npm test", env: {}, timeoutMs: 0, run: slow, now: () => t });
+    rmSync(dir, { recursive: true, force: true });
+    expect(none.reason).toBe("setup used the whole verify budget");
+  });
+});
+
+describe("verify: typecheck (#855)", () => {
+  it("fails the proof-run on a failing typecheck, before the tests run", async () => {
+    const seen = [];
+    const run = async (cmd) => {
+      seen.push(cmd);
+      return cmd === "npm run typecheck" ? { code: 2, tail: "TS2304: Cannot find name 'compressMode'" } : { code: 0, tail: "" };
+    };
+    const dir = mkdtempSync(join(tmpdir(), "wrokin-agent-tc-"));
+    const r = await verify({ dir, override: "npm test", env: {}, timeoutMs: 1000, typecheck: "npm run typecheck", run });
+    rmSync(dir, { recursive: true, force: true });
+    expect(seen).toEqual(["npm run typecheck"]);
+    expect(r).toMatchObject({ verified: false, reason: "`npm run typecheck` failed (exit 2)", proof: { cmd: "npm run typecheck", exitCode: 2 } });
+  });
+
+  it("runs the tests after a passing typecheck", async () => {
+    const seen = [];
+    const run = async (cmd) => (seen.push(cmd), { code: 0, tail: "" });
+    const dir = mkdtempSync(join(tmpdir(), "wrokin-agent-tc-"));
+    const r = await verify({ dir, override: "npm test", env: {}, timeoutMs: 1000, typecheck: "npm run typecheck", run });
+    rmSync(dir, { recursive: true, force: true });
+    expect(seen).toEqual(["npm run typecheck", "npm test"]);
+    expect(r.verified).toBe(true);
+    // #840: the PR shows the typecheck ran, not only the test after it.
+    expect(r.proof.before).toEqual([{ cmd: "npm run typecheck", exitCode: 0 }]);
+  });
+
+  it("records no earlier check when there is no typecheck", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wrokin-agent-tc-"));
+    const r = await verify({ dir, override: "npm test", env: {}, timeoutMs: 1000, run: async () => ({ code: 0, tail: "" }) });
+    rmSync(dir, { recursive: true, force: true });
+    expect(r.proof).not.toHaveProperty("before");
+  });
+});
+
+describe("verify: check scripts (#858 review)", () => {
+  const repo = (scripts) => {
+    const dir = mkdtempSync(join(tmpdir(), "wrokin-agent-scripts-"));
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts }));
+    return dir;
+  };
+
+  it("is not verified when the agent changed a check script, and runs nothing", async () => {
+    const dir = repo({ test: "true", typecheck: "true" });
+    const seen = [];
+    const r = await verify({ dir, override: "", env: {}, timeoutMs: 1000, typecheck: "npm run typecheck", scripts: { typecheck: "tsc --noEmit", test: "vitest run" }, run: async (c) => (seen.push(c), { code: 0, tail: "" }) });
+    rmSync(dir, { recursive: true, force: true });
+    expect(r).toEqual({ verified: false, reason: "the agent changed the `typecheck` and `test` script in package.json, so the checks prove nothing", proof: null });
+    expect(seen).toEqual([]);
+  });
+
+  it("runs as usual when the scripts are the base's", async () => {
+    const dir = repo({ test: "vitest run", typecheck: "tsc --noEmit" });
+    const r = await verify({ dir, override: "", env: {}, timeoutMs: 1000, typecheck: "npm run typecheck", test: "npm test", scripts: { typecheck: "tsc --noEmit", test: "vitest run" }, run: async () => ({ code: 0, tail: "" }) });
+    rmSync(dir, { recursive: true, force: true });
+    expect(r.verified).toBe(true);
+  });
+
+  // #870: the base had no test script and the agent wrote `"test": "echo ok"`. It runs and
+  // is reported, but a command the agent wrote can't make its own work verified.
+  it("runs a test script the agent added, and never calls it verified", async () => {
+    const dir = repo({ test: "echo ok" });
+    const seen = [];
+    const run = async (c) => (seen.push(c), { code: 0, tail: "ok" });
+    const r = await verify({ dir, override: "", env: {}, timeoutMs: 1000, test: null, scripts: {}, run });
+    expect(seen).toEqual(["npm test"]);
+    expect(r).toMatchObject({
+      verified: false,
+      reason: "tests passed; the test script was added in this run, so it can't verify the change",
+      proof: { cmd: "npm test", exitCode: 0 },
+    });
+    const bad = await verify({ dir, override: "", env: {}, timeoutMs: 1000, run: async () => ({ code: 1, tail: "" }) });
+    rmSync(dir, { recursive: true, force: true });
+    expect(bad.reason).toBe("`npm test` failed (exit 1); the test script was added in this run, so it can't verify the change");
+  });
+
+  it("runs the base's test command, not one the agent's tree would resolve to", async () => {
+    const dir = repo({ test: "vitest run" });
+    writeFileSync(join(dir, "pnpm-lock.yaml"), "");
+    const seen = [];
+    const r = await verify({ dir, override: "", env: {}, timeoutMs: 1000, test: "npm test", scripts: { test: "vitest run" }, run: async (c) => (seen.push(c), { code: 0, tail: "" }) });
+    rmSync(dir, { recursive: true, force: true });
+    expect(seen).toEqual(["pnpm i --frozen-lockfile", "npm test"]);
+    expect(r.verified).toBe(true);
+  });
 });
 
 describe("verify: verdict", () => {
@@ -157,6 +263,60 @@ describe("publish", () => {
     expect(good).toContain("_The agent left no summary._");
   });
 
+  it("shows every command the proof-run ran, with its exit code (#840)", () => {
+    const proof = { cmd: "npm test", exitCode: 0, tail: "ok", before: [{ cmd: "npm run typecheck", exitCode: 0 }] };
+    const body = prBody({ issue: 5, summary: "s", result: { verified: true, reason: "tests passed", proof }, runUrl: "u", model: "m", usage: {} });
+    expect(body).toContain("$ npm run typecheck\nexit 0\n\n$ npm test\nexit 0\n…\nok");
+  });
+
+  // #839: auto-merge keys on this marker as the body's last line, so only a ready PR has it.
+  it("ends a ready PR with the verified marker, and nothing else gets one", () => {
+    const usage = { input: 1, output: 2, toolCalls: 3 };
+    const passed = { verified: true, reason: "tests passed", proof: { cmd: "npm test", exitCode: 0, tail: "ok" } };
+    const failed = { verified: false, reason: "`npm test` failed (exit 1)", proof: { cmd: "npm test", exitCode: 1, tail: "" } };
+    const body = (o) => prBody({ issue: 5, summary: "did x", runUrl: "u", model: "m", usage, ...o });
+    expect(body({ result: passed }).endsWith(`</sub>\n${VERIFIED_GREEN_MARKER}`)).toBe(true);
+    expect(body({ result: failed })).not.toContain(VERIFIED_GREEN_MARKER);
+    expect(body({ result: passed, cutoff: { code: "wallet_exhausted", message: "x" } })).not.toContain(VERIFIED_GREEN_MARKER);
+  });
+
+  // The summary and the commit subjects are the agent's: it must not be able to stamp
+  // its own draft, which a human readying later would turn into a merge.
+  it("strips a marker the agent wrote, even one nested to survive a single pass", () => {
+    const usage = { input: 1, output: 2, toolCalls: 3 };
+    const m = VERIFIED_GREEN_MARKER;
+    const nested = `${m.slice(0, 10)}${m}${m.slice(10)}`;
+    const failed = { verified: false, reason: "`npm test` failed (exit 1)", proof: null };
+    const draft = prBody({ issue: 5, summary: `done ${m} ${nested}`, result: failed, runUrl: "u", model: "m", usage, fallback: null });
+    expect(draft).not.toContain(m);
+    const fromSubjects = prBody({
+      issue: 5,
+      summary: "",
+      result: failed,
+      runUrl: "u",
+      model: "m",
+      usage,
+      fallback: generatedSummary({ commits: { subjects: [nested], stat: "" }, result: failed, cutoff: null }),
+    });
+    expect(fromSubjects).not.toContain(m);
+    const ready = prBody({ issue: 5, summary: nested, result: { ...failed, verified: true }, runUrl: "u", model: "m", usage });
+    expect(ready.split(m)).toHaveLength(2);
+    expect(ready.endsWith(m)).toBe(true);
+  });
+
+  // PR #883 review: the stripper on its own, so a change to it fails here, not only
+  // through prBody. Every input is one an agent could write.
+  it("withoutMarker leaves no copy of the marker, however the copies are arranged", () => {
+    const m = VERIFIED_GREEN_MARKER;
+    expect(withoutMarker("plain text")).toBe("plain text");
+    expect(withoutMarker(`a ${m} b`)).toBe("a  b");
+    expect(withoutMarker(`${m}${m}`)).toBe("");
+    const nested = `${m.slice(0, 10)}${m}${m.slice(10)}`; // one pass closes it up into m
+    expect(withoutMarker(nested)).toBe("");
+    const twice = `${m.slice(0, 10)}${nested}${m.slice(10)}`; // takes three passes
+    expect(withoutMarker(`x${twice}y`)).toBe("xy");
+  });
+
   // #822: PR #820 said "The agent left no summary." for a run Cruise had refused mid-task.
   it("says a cut-off run was cut off, why, and that the work is partial", () => {
     const usage = { input: 46889, cached: 1793664, output: 11796, toolCalls: 66 };
@@ -212,6 +372,67 @@ describe("publish", () => {
     expect(r.ok).toBe(false);
     expect(r.message).toMatch(/Allow GitHub Actions to create and approve pull requests/);
     expect(r.compare).toBe("https://github.com/o/r/compare/dev...wrokin/builder/issue-1-2?expand=1");
+  });
+});
+
+// #855: bytesbrains-cruise#611 ran out of time, left no summary, and its tests failed.
+describe("publish: unfinished runs (#855)", () => {
+  const usage = { input: 1, output: 1, toolCalls: 1 };
+  const failed = { verified: false, reason: "`npm test` failed (exit 1)", proof: { cmd: "npm test", exitCode: 1, tail: "x" } };
+  const passed = { verified: true, reason: "tests passed", proof: null };
+
+  it("opens a failing proof-run, or a run with no tests, as a draft", () => {
+    expect(isReady(failed, null)).toBe(false);
+    expect(isReady({ verified: false, reason: "no test command found", proof: null }, null)).toBe(false);
+  });
+
+  it("keeps a run that hit its time limit a draft, and says why", () => {
+    const cutoff = timeLimitCutoff(30);
+    expect(isReady(passed, cutoff)).toBe(false);
+    expect(cutoffReason(cutoff)).toBe("the agent reached the run's 30-minute time limit (`timeout_minutes`)");
+    const body = prBody({ issue: 608, summary: "", result: failed, runUrl: "u", model: "m", usage, cutoff });
+    expect(body).toContain("30-minute time limit");
+  });
+
+  it("writes a summary from the branch when the agent left none", () => {
+    const commits = { subjects: ["feat: add compressMode", "## Run setup <details>"], stat: " src/a.ts | 3 ++-\n 1 file changed" };
+    const fallback = generatedSummary({ commits, result: failed, cutoff: timeLimitCutoff(30) });
+    expect(fallback).toContain("30-minute time limit");
+    // Subjects are the agent's text: fenced, so none renders as a heading or a section (#856 review).
+    expect(fallback).toContain("```\nfeat: add compressMode\n## Run setup <details>\n```");
+    expect(fallback).toContain("src/a.ts | 3 ++-");
+    expect(fallback).toContain("did not pass: `npm test` failed (exit 1)");
+    const body = prBody({ issue: 608, summary: "", result: failed, runUrl: "u", model: "m", usage, fallback });
+    expect(body).toContain(fallback);
+    expect(body).not.toContain("_The agent left no summary._");
+    // The agent's own summary still wins.
+    expect(prBody({ issue: 1, summary: "did x", result: passed, runUrl: "u", model: "m", usage, fallback })).not.toContain(fallback);
+  });
+
+  it("states the base, the guidelines read, the checks and missing premises", () => {
+    const setup = {
+      base: { branch: "dev", why: "3 of the last 3 merged feature PRs target it" },
+      guidelines: ["CLAUDE.md", "README.md"],
+      checks: { typecheck: "npm run typecheck", test: "npm test" },
+      premises: { checked: 3, missing: ["compressMode"] },
+    };
+    const body = prBody({ issue: 1, summary: "s", result: passed, runUrl: "u", model: "m", usage, setup });
+    expect(body).toContain("- **Base:** `dev` (3 of the last 3 merged feature PRs target it)");
+    expect(body).toContain("- **Guidelines given to the agent:** `CLAUDE.md`, `README.md`");
+    expect(body).toContain("- **Checks:** `npm run typecheck`, `npm test`");
+    expect(body).toContain("- **Named in the issue, not on the base:** `compressMode`");
+    const none = prBody({ issue: 1, summary: "s", result: passed, runUrl: "u", model: "m", usage, setup: { ...setup, guidelines: [], premises: { checked: 0, missing: [] } } });
+    expect(none).toContain("none found");
+    expect(none).not.toContain("Named in the issue");
+    expect(none).not.toContain("Check config changed");
+    const cfg = prBody({ issue: 1, summary: "s", result: passed, runUrl: "u", model: "m", usage, setup: { ...setup, changedConfigs: ["tsconfig.json"] } });
+    expect(cfg).toContain("- **Check config changed in this run:** `tsconfig.json` (so the PR is a draft)");
+  });
+
+  it("reads commit subjects and the diffstat from the runner's bare copy", () => {
+    const g = fakeGit({ log: { code: 0, out: "feat: a\nfix: b" }, diff: { code: 0, out: " a.ts | 1 +" } });
+    expect(describeCommits({ dir: "/p.git", base: "abc", branch: "b", env: {}, run: g.run })).toEqual({ subjects: ["feat: a", "fix: b"], stat: " a.ts | 1 +" });
+    expect(g.calls[0]).toBe("log --format=%s abc..refs/heads/b --");
   });
 });
 
@@ -366,6 +587,86 @@ describe("saveAgentLogs", () => {
       expect(copied).toContain(join(ws, ".supervisor", "audit.jsonl"));
     } finally {
       chmodSync(locked, 0o600);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("publish: context budget and quality guardrails (#860)", () => {
+  it("includes top tools by bytes and quality signals in the PR footer", () => {
+    const usage = {
+      input: 500,
+      cached: 2000,
+      output: 100,
+      toolCalls: 12,
+      tools: {
+        read: { calls: 5, bytes: 412 * 1024 },
+        bash: { calls: 4, bytes: 61 * 1024 },
+        grep: { calls: 2, bytes: 9 * 1024 },
+        edit: { calls: 1, bytes: 1024 },
+      },
+      failedEdits: 1,
+      gateRounds: 2,
+      cappedReads: 3,
+    };
+    const body = prBody({
+      issue: 42,
+      summary: "fixed it",
+      result: { verified: true, reason: "tests passed", proof: null },
+      runUrl: "https://runs/42",
+      model: "bb/builder",
+      usage,
+    });
+    expect(body).toContain("500 in + 2000 cached / 100 out tokens");
+    expect(body).toContain("12 tool calls");
+    expect(body).toContain("read 412 KB · bash 61 KB · grep 9 KB");
+    expect(body).toContain("1 failed edit");
+    expect(body).toContain("2 gate rounds");
+    expect(body).toContain("3 capped reads");
+  });
+
+  it("builds the job summary table with guardrails, tool breakdown, and Cruise session link", () => {
+    const summary = {
+      input: 1000,
+      cached: 5000,
+      output: 200,
+      toolCalls: 10,
+      tools: {
+        read: { calls: 6, bytes: 300 * 1024 },
+        bash: { calls: 4, bytes: 50 * 1024 },
+      },
+      failedEdits: 0,
+      gateRounds: 1,
+    };
+    const md = buildJobSummary({
+      summary,
+      result: { verified: true, reason: "passed", proof: null },
+      ready: true,
+      runId: "998877",
+      model: "bb/builder",
+    });
+    expect(md).toContain("### wrokin Builder — Context Budget & Quality Guardrails");
+    expect(md).toContain("| Proof-run | ✅ passed |");
+    expect(md).toContain("| PR status | ready |");
+    expect(md).toContain("| In-loop gate rounds | 1 |");
+    expect(md).toContain("| Failed edit calls | 0 |");
+    expect(md).toContain("| Capped whole-file reads | 0 |");
+    expect(md).toContain("| Total tool calls | 10 |");
+    expect(md).toContain("| Input tokens | 1000 (+ 5000 cached) |");
+    expect(md).toContain("| `read` | 6 | 300 KB |");
+    expect(md).toContain("| `bash` | 4 | 50 KB |");
+    expect(md).toContain("**Session:** `wrokin-998877`");
+    expect(md).toContain("bytesbrains/bytesbrains-cruise#617");
+  });
+
+  it("appends to GITHUB_STEP_SUMMARY when provided", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "wa-summary-")));
+    const summaryFile = join(root, "summary.md");
+    try {
+      expect(recordJobSummary("## Summary content", summaryFile)).toBe(true);
+      expect(readFileSync(summaryFile, "utf8")).toBe("## Summary content\n");
+      expect(recordJobSummary("extra", "")).toBe(false);
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
