@@ -248,9 +248,9 @@ describe("publish: unfinished runs (#855)", () => {
     expect(none).not.toContain("Check config changed");
     const cfg = prBody({ issue: 1, summary: "s", result: passed, runUrl: "u", model: "m", usage, setup: { ...setup, changedConfigs: ["tsconfig.json"] } });
     expect(cfg).toContain("- **Check config changed in this run:** `tsconfig.json` (so the PR is a draft)");
-    expect(none).not.toContain("but not in this PR");
+    expect(none).not.toContain("doesn't hold as is");
     const hidden = prBody({ issue: 1, summary: "s", result: passed, runUrl: "u", model: "m", usage, setup: { ...setup, unpushedConfigs: ["vitest.config.ts"] } });
-    expect(hidden).toContain("- **Check config in the checkout but not in this PR:** `vitest.config.ts` (so the PR is a draft)");
+    expect(hidden).toContain("- **Check config in the checkout that this PR doesn't hold as is:** `vitest.config.ts` (so the PR is a draft)");
   });
 
   it("reads commit subjects and the diffstat from the runner's bare copy", () => {

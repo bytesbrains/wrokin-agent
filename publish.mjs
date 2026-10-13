@@ -293,7 +293,7 @@ function setupSection(setup) {
     lines.push(`- **Check config changed in this run:** ${setup.changedConfigs.map((f) => `\`${f}\``).join(", ")} (so the PR is a draft)`);
   }
   if (setup.unpushedConfigs?.length) {
-    lines.push(`- **Check config in the checkout but not in this PR:** ${setup.unpushedConfigs.map((f) => `\`${f}\``).join(", ")} (so the PR is a draft)`);
+    lines.push(`- **Check config in the checkout that this PR doesn't hold as is:** ${setup.unpushedConfigs.map((f) => `\`${f}\``).join(", ")} (so the PR is a draft)`);
   }
   if (setup.premises.missing.length) {
     lines.push(`- **Named in the issue, not on the base:** ${setup.premises.missing.map((m) => `\`${m}\``).join(", ")}`);
