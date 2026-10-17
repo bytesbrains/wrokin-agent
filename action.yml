@@ -93,7 +93,7 @@ runs:
     # A caret range, not "22": setup-node takes a locally cached match first, and a
     # self-hosted runner can have a 22.x older than pi accepts in its tool cache.
     - if: steps.node.outputs.need == 'true'
-      uses: actions/setup-node@v7
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: "^${{ steps.node.outputs.min }}"
     # Every later step runs this action from a copy the runner owns, outside the checkout.
@@ -163,7 +163,7 @@ runs:
         INPUT_GITHUB_TOKEN: ${{ steps.creds.outputs.github_token || inputs.github_token }}
       run: node "${{ steps.src.outputs.dir }}/report-failure.mjs"
     - if: always() && inputs.issue_number != ''
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: wrokin-agent-${{ inputs.role }}-issue-${{ inputs.issue_number }}
         path: |
