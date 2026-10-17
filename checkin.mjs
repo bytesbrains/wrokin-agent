@@ -3,7 +3,9 @@
 // With a `cruise_api_key` input the run never contacts wrok.in (enterprise, self-hosted
 // Cruise). Without one, it checks in: a GitHub OIDC token for audience `wrokin-agent`
 // goes to `POST /agent/checkin`, and the Builder card's Cruise key, lane, base URL,
-// read cap (#864) and base branch (#857) come back. That is the only call to wrok.in in a run. pi then calls Cruise directly.
+// read cap (#864) and base branch (#857) come back. pi then calls Cruise directly. The
+// run's only other call to wrok.in is at the end, and only for a ready PR: `reportVerified`
+// records the PR's head sha for auto-merge (#893).
 //
 // Check-in also returns a wrokin App token for this one repository (#817): contents,
 // pull requests and issues, never workflows. Every GitHub call in the run uses it, so
@@ -27,6 +29,8 @@ export function readInputs(env) {
     model: env.INPUT_MODEL ?? "",
     baseUrl: env.INPUT_CRUISE_BASE_URL ?? "",
     readCapKb: env.INPUT_READ_CAP_KB ?? "",
+    compressToolOutput: env.INPUT_COMPRESS_TOOL_OUTPUT ?? "",
+    thinking: env.INPUT_THINKING ?? "",
     apiBase: env.INPUT_WROKIN_API_BASE || "https://api.wrok.in",
     role: env.INPUT_ROLE || "builder",
   };
@@ -106,9 +110,41 @@ export async function checkin({ apiBase, oidc, role, fetchFn = fetch }) {
     // the run works the base out itself. A `base_branch` input beats it in main.mjs, which
     // keeps the two apart so the log can say which one chose.
     baseBranch: typeof body.base_branch === "string" ? body.base_branch : "",
+    // A boolean (true = on, false = off). Absent from an older wrok.in: empty, and
+    // compress-output.mjs applies its own default (on).
+    compressToolOutput: typeof body.compress_tool_output === "boolean" ? String(body.compress_tool_output) : "",
+    // A string ("default", "off", "on"). Absent from an older wrok.in: empty, and
+    // pi-config.mjs applies its own default.
+    thinking: typeof body.thinking === "string" ? body.thinking : "",
     // Absent from an older wrok.in: the run then falls back to the job's GITHUB_TOKEN.
     githubToken: typeof body.github_token === "string" ? body.github_token : "",
   };
+}
+
+/**
+ * Tells wrok.in this run verified PR `pr` at `headSha` (#893): POST /agent/verified, with
+ * a fresh OIDC token (the check-in one has likely expired by now). Auto-merge requires
+ * this record for the PR's current head; the marker in the PR body is editable text.
+ * Called only for a ready PR on a run that checked in. `{ ok: true }` or `{ error }`.
+ */
+export async function reportVerified(env, { apiBase, pr, headSha, fetchFn = fetch }) {
+  const badBase = checkApiBase(apiBase);
+  if (badBase) return { error: badBase };
+  const tok = await requestOidc(env, AUDIENCE, fetchFn);
+  if (tok.error) return { error: tok.error };
+  let res;
+  try {
+    res = await fetchFn(`${apiBase.replace(/\/+$/, "")}/agent/verified`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "user-agent": "wrokin-agent" },
+      body: JSON.stringify({ oidc: tok.oidc, pr, head_sha: headSha }),
+    });
+  } catch (err) {
+    return { error: `Could not reach wrok.in: ${oneLine(err.message)}` };
+  }
+  if (res.status === 200) return { ok: true };
+  const body = await res.json().catch(() => null);
+  return { error: `wrok.in refused (HTTP ${res.status}): ${oneLine(body?.error ?? "no reason given")}` };
 }
 
 /**
@@ -119,7 +155,14 @@ export async function checkin({ apiBase, oidc, role, fetchFn = fetch }) {
 export async function resolve(env, { fetchFn = fetch, log = console.log } = {}) {
   const i = readInputs(env);
   if (i.key) {
-    return { model: i.model || DEFAULT_MODEL, baseUrl: i.baseUrl || DEFAULT_BASE_URL, readCapKb: i.readCapKb, baseBranch: "" };
+    return {
+      model: i.model || DEFAULT_MODEL,
+      baseUrl: i.baseUrl || DEFAULT_BASE_URL,
+      readCapKb: i.readCapKb,
+      baseBranch: "",
+      compressToolOutput: i.compressToolOutput,
+      thinking: i.thinking,
+    };
   }
   const tok = await requestOidc(env, AUDIENCE, fetchFn);
   if (tok.error) return { error: tok.error };
@@ -133,6 +176,10 @@ export async function resolve(env, { fetchFn = fetch, log = console.log } = {}) 
     // "0" is an input too (off), so only an empty input defers to the card.
     readCapKb: i.readCapKb !== "" ? i.readCapKb : got.readCapKb,
     baseBranch: got.baseBranch,
+    // An explicit input (true/false/0/off) wins over the card; empty defers to it.
+    compressToolOutput: i.compressToolOutput !== "" ? i.compressToolOutput : got.compressToolOutput,
+    // An explicit input ("off", "on", "default") wins over the card; empty defers to it.
+    thinking: i.thinking !== "" ? i.thinking : got.thinking,
   };
   // Each value becomes one `name=value` line in $GITHUB_OUTPUT; a line break would
   // let a value write outputs of its own. Checked before the masks too: `::add-mask::`
@@ -151,7 +198,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     recordSetupError(r.error);
     process.exit(1);
   }
-  const out = [`model=${r.model}`, `cruise_base_url=${r.baseUrl}`, `read_cap_kb=${r.readCapKb}`, `card_base_branch=${r.baseBranch}`];
+  const out = [
+    `model=${r.model}`,
+    `cruise_base_url=${r.baseUrl}`,
+    `read_cap_kb=${r.readCapKb}`,
+    `card_base_branch=${r.baseBranch}`,
+    `compress_tool_output=${r.compressToolOutput}`,
+    `thinking=${r.thinking}`,
+  ];
   if (r.key) out.push(`cruise_api_key=${r.key}`);
   if (r.githubToken) out.push(`github_token=${r.githubToken}`);
   appendFileSync(process.env.GITHUB_OUTPUT, `${out.join("\n")}\n`);

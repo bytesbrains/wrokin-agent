@@ -4,7 +4,7 @@
 import { spawnSync } from "node:child_process";
 import { appendFileSync, copyFileSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { formatBytes, formatTopTools } from "./run-pi.mjs";
+import { cacheReadShare, formatBytes, formatTopTools, UNCACHED_ISSUE, UNCACHED_MIN_TURNS, UNCACHED_SHARE } from "./run-pi.mjs";
 
 export const UNVERIFIED_BANNER =
   "> ⚠️ **Authored, NOT proven to build.** The wrokin Builder could not verify this change " +
@@ -365,6 +365,14 @@ export function buildJobSummary({ summary = {}, result = null, ready = false, ru
     ? `${summary.input ?? 0} (+ ${summary.cached} cached)`
     : `${summary.input ?? 0}`;
   parts.push(`| Input tokens | ${inputStr} |`);
+  const share = cacheReadShare(summary);
+  if (share !== null) {
+    const pct = `${Math.round(share * 100)}%`;
+    const low = share < UNCACHED_SHARE && (summary.turns ?? 0) >= UNCACHED_MIN_TURNS;
+    parts.push(
+      `| Read from prompt cache | ${low ? `⚠️ ${pct}: the provider barely cached this run, so it cost several times more; see ${UNCACHED_ISSUE}` : pct} |`,
+    );
+  }
   parts.push(`| Output tokens | ${summary.output ?? 0} |`);
   parts.push("");
 
@@ -416,7 +424,7 @@ export const isActionsPrRefusal = (r) =>
 
 export async function openPr(gh, { repo, base, branch, title, body, draft }) {
   const r = await gh.call("POST", `/repos/${repo}/pulls`, { title, head: branch, base, body, draft });
-  if (r.ok) return { ok: true, number: r.data.number, url: r.data.html_url };
+  if (r.ok) return { ok: true, number: r.data.number, url: r.data.html_url, headSha: r.data.head?.sha ?? "" };
   const compare = `https://github.com/${repo}/compare/${base}...${branch}?expand=1`;
   if (isActionsPrRefusal(r)) {
     return {

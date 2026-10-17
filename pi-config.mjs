@@ -13,6 +13,18 @@ export function wantsThinkingSwitch(model) {
   return /^bb[-\w]*\//.test(model) || /deepseek/i.test(model);
 }
 
+/**
+ * Resolves whether `--thinking off` should be passed to pi.
+ * - "off": explicitly turn thinking off (true)
+ * - "on": explicitly leave thinking on (false)
+ * - "default" / empty / null: defer to wantsThinkingSwitch (turn off on lanes & DeepSeek)
+ */
+export function resolveThinking(thinkingSetting, model) {
+  if (thinkingSetting === "off") return true;
+  if (thinkingSetting === "on") return false;
+  return wantsThinkingSwitch(model);
+}
+
 /** pi's models.json. The key stays an env placeholder: it is never written to disk. */
 export function modelsJson(model, baseUrl) {
   const thinking = wantsThinkingSwitch(model);

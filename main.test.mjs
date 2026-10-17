@@ -36,10 +36,16 @@ const fakeGh = (issue) => {
 describe("readInputs", () => {
   it("defaults the role and the timeout, and builds the run link", () => {
     const i = readInputs(env());
-    expect(i).toMatchObject({ role: "builder", issue: 5, timeoutMs: 30 * 60_000, runUrl: "https://github.com/o/r/actions/runs/9", temp: "/rt/wrokin-agent" });
+    expect(i).toMatchObject({ role: "builder", issue: 5, timeoutMs: 30 * 60_000, runUrl: "https://github.com/o/r/actions/runs/9", temp: "/rt/wrokin-agent", thinking: "" });
     expect(readInputs(env({ INPUT_TIMEOUT_MINUTES: "-3" })).timeoutMs).toBe(30 * 60_000);
     expect(readInputs(env({ INPUT_TIMEOUT_MINUTES: "45" })).timeoutMs).toBe(45 * 60_000);
     expect(readInputs(env({ INPUT_TIMEOUT_MINUTES: "nope" }))).toMatchObject({ minutes: 30, timeoutMs: 30 * 60_000 });
+    expect(readInputs(env({ INPUT_THINKING: "off" })).thinking).toBe("off");
+    expect(readInputs(env({ INPUT_THINKING: "on" })).thinking).toBe("on");
+    const prInput = readInputs(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "42" }));
+    expect(prInput).toMatchObject({ role: "builder-fix", issue: null, pr: 42 });
+    expect(readInputs(env({ INPUT_ISSUE_NUMBER: "5", INPUT_PR_NUMBER: "42" })).role).toBe("builder");
+    expect(readInputs(env({ INPUT_ISSUE_NUMBER: "5", INPUT_PR_NUMBER: "42", INPUT_ROLE: "builder-fix" })).role).toBe("builder-fix");
   });
 });
 
@@ -66,10 +72,101 @@ describe("main: early outcomes", () => {
     expect(gh.comments[0]).toMatch(/#5 is a pull request, not an issue/);
   });
 
-  it("stays silent without an issue number, since there is nowhere to comment", async () => {
+  it("stays silent without an issue number or PR number, since there is nowhere to comment", async () => {
     const gh = fakeGh({ ok: true, status: 200, data: {} });
-    await main(env({ INPUT_ISSUE_NUMBER: "" }), gh);
+    await main(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "" }), gh);
     expect(gh.comments).toEqual([]);
+  });
+
+  it("comments on PR when fetchPR fails (#809)", async () => {
+    const gh = {
+      comments: [],
+      async call(method, path, body) {
+        if (method === "POST") {
+          this.comments.push(body.body);
+          return { ok: true, status: 201 };
+        }
+        return { ok: false, status: 404 };
+      },
+      async all() {
+        return { ok: true, items: [] };
+      },
+    };
+    await main(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "42" }), gh);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]).toMatch(/could not read pull request #42/);
+  });
+
+  it("comments when both issue_number and pr_number are passed", async () => {
+    const gh = fakeGh({ ok: true, status: 200, data: {} });
+    await main(env({ INPUT_ISSUE_NUMBER: "5", INPUT_PR_NUMBER: "10" }), gh);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]).toMatch(/pass either issue_number or pr_number, not both/);
+  });
+
+  it("comments when the PR head branch is missing", async () => {
+    const gh = {
+      comments: [],
+      async call(method, path, body) {
+        if (method === "POST") {
+          this.comments.push(body.body);
+          return { ok: true, status: 201 };
+        }
+        return { ok: true, status: 200, data: { number: 42, head: {} } };
+      },
+      async all() {
+        return { ok: true, items: [] };
+      },
+    };
+    await main(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "42" }), gh);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]).toMatch(/the PR's head branch is missing/);
+  });
+
+  it("comments when the PR is from a fork", async () => {
+    const gh = {
+      comments: [],
+      async call(method, path, body) {
+        if (method === "POST") {
+          this.comments.push(body.body);
+          return { ok: true, status: 201 };
+        }
+        return {
+          ok: true,
+          status: 200,
+          data: { number: 42, head: { ref: "fix-bug", repo: { full_name: "forker/r" } } },
+        };
+      },
+      async all() {
+        return { ok: true, items: [] };
+      },
+    };
+    await main(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "42", GITHUB_REPOSITORY: "o/r" }), gh);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]).toMatch(/PRs from forks are not supported/);
+  });
+
+  it("comments when the PR head branch name starts with '-'", async () => {
+    const gh = {
+      comments: [],
+      async call(method, path, body) {
+        if (method === "POST") {
+          this.comments.push(body.body);
+          return { ok: true, status: 201 };
+        }
+        return {
+          ok: true,
+          status: 200,
+          data: { number: 42, head: { ref: "--upload-pack", repo: { full_name: "o/r" } } },
+        };
+      },
+      async all() {
+        return { ok: true, items: [] };
+      },
+    };
+    await main(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "42", GITHUB_REPOSITORY: "o/r" }), gh);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]).toMatch(/invalid head branch name/);
   });
 });
 

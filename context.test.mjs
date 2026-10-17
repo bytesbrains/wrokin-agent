@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -169,6 +169,18 @@ describe("premises", () => {
   });
 });
 
+// #865: two of six measured runs spent most of their tool bytes on whole-suite test
+// dumps; the role prompt asks for short command output, as it asks for reads by range.
+describe("roles/builder.md", () => {
+  const role = readFileSync(new URL("./roles/builder.md", import.meta.url), "utf8");
+
+  it("asks for reads by range and short command output", () => {
+    expect(role).toContain("**Read by range.**");
+    expect(role).toContain("**Keep command output short**");
+    expect(role).toMatch(/\| tail -\d+/);
+  });
+});
+
 describe("runPrompt", () => {
   const setup = {
     role: "## Your role",
@@ -185,6 +197,17 @@ describe("runPrompt", () => {
     expect(p).toContain("**Time limit:** 30 minutes");
     expect(p).toContain("`npm run typecheck` and `npm test`");
     expect(p).toContain("**Not found on `dev`:** `compressMode`");
+  });
+
+  // #865: the install before the agent, said as it happened.
+  it("says whether dependencies were installed before the agent started", () => {
+    expect(runPrompt(setup)).not.toContain("**Dependencies:**");
+    expect(runPrompt({ ...setup, deps: { cmd: "npm ci", ok: true } })).toContain(
+      "**Dependencies:** installed before you started (`npm ci`). Don't reinstall",
+    );
+    expect(runPrompt({ ...setup, deps: { cmd: "npm ci", ok: false } })).toContain(
+      "**Dependencies:** `npm ci` failed before you started. Install them yourself",
+    );
   });
 
   it("frames the guidelines as binding for the work, not for the run", () => {

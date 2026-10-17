@@ -63,3 +63,75 @@ export async function fetchIssue(gh, repo, number) {
   const comments = await gh.all(`/repos/${repo}/issues/${number}/comments`);
   return { issue: issue.data, comments: comments.items };
 }
+
+/** The task file pi reads for a PR fix: PR metadata, failing checks, review comments (#809). */
+export function prTaskMarkdown(repo, pr, { reviewComments = [], issueComments = [], failingChecks = [] } = {}) {
+  const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}\n\n[… truncated]` : s);
+  const headSha = pr.head?.sha ? pr.head.sha.slice(0, 7) : "";
+  const parts = [
+    `# Pull Request #${pr.number} in ${repo}: ${pr.title}`,
+    "",
+    `- **Head branch:** \`${pr.head?.ref ?? "unknown"}\`${headSha ? ` (${headSha})` : ""}`,
+    `- **Base branch:** \`${pr.base?.ref ?? "unknown"}\``,
+    "",
+    "## Description",
+    "",
+    clip(pr.body ?? "(no description)", MAX_BODY),
+  ];
+
+  if (failingChecks.length) {
+    parts.push("", "## Failing Checks / CI", "");
+    for (const c of failingChecks) {
+      const title = c.output?.title ? ` — ${c.output.title}` : "";
+      parts.push(`### \`${c.name}\` (${c.conclusion ?? "failed"})${title}`);
+      if (c.output?.summary) parts.push("", clip(c.output.summary, MAX_COMMENT));
+      if (c.output?.text) parts.push("", "```", clip(c.output.text, MAX_COMMENT), "```");
+      parts.push("");
+    }
+  }
+
+  if (reviewComments.length) {
+    parts.push("", "## Review Comments", "");
+    for (const rc of reviewComments) {
+      const loc = rc.path ? ` on \`${rc.path}${rc.line ? `:${rc.line}` : ""}\`` : "";
+      parts.push(`### @${rc.user?.login ?? "reviewer"}${loc}`, "");
+      if (rc.diff_hunk) parts.push("```diff", rc.diff_hunk, "```", "");
+      parts.push(clip(rc.body ?? "", MAX_COMMENT), "");
+    }
+  }
+
+  const thread = issueComments
+    .filter((c) => c.user?.type !== "Bot")
+    .map((c) => `### @${c.user?.login ?? "unknown"}\n\n${clip(c.body ?? "", MAX_COMMENT)}`)
+    .join("\n\n");
+  if (thread) {
+    parts.push("", "## Discussion Comments", "", thread);
+  }
+
+  parts.push("");
+  return parts.join("\n");
+}
+
+export async function fetchPR(gh, repo, number) {
+  const pr = await gh.call("GET", `/repos/${repo}/pulls/${number}`);
+  if (!pr.ok) return { error: `could not read pull request #${number} (HTTP ${pr.status})` };
+  const reviewComments = await gh.all(`/repos/${repo}/pulls/${number}/comments`);
+  const issueComments = await gh.all(`/repos/${repo}/issues/${number}/comments`);
+  let failingChecks = [];
+  const headSha = pr.data.head?.sha;
+  if (headSha) {
+    const cr = await gh.call("GET", `/repos/${repo}/commits/${headSha}/check-runs`);
+    if (cr.ok && Array.isArray(cr.data?.check_runs)) {
+      failingChecks = cr.data.check_runs.filter((c) =>
+        ["failure", "timed_out", "action_required"].includes(c.conclusion),
+      );
+    }
+  }
+  return {
+    pr: pr.data,
+    reviewComments: reviewComments.items,
+    issueComments: issueComments.items,
+    failingChecks,
+  };
+}
+

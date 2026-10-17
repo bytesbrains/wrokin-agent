@@ -25,8 +25,12 @@ inputs:
     description: "Issue to work on. Defaults to the triggering issue. Empty: set up and check only, run nothing."
     required: false
     default: ${{ github.event.issue.number }}
+  pr_number:
+    description: "Pull request to work on (for builder-fix role). Defaults to the triggering pull request. Empty: work on issue_number."
+    required: false
+    default: ${{ github.event.pull_request.number }}
   role:
-    description: "Which Builder-family role runs. Today: builder."
+    description: "Which Builder-family role runs: builder, builder-fix."
     required: false
     default: "builder"
   github_token:
@@ -43,6 +47,14 @@ inputs:
     default: ""
   read_cap_kb:
     description: "Soft cap, in KB, on a whole-file read: a read that passes neither offset nor limit and returns more is cut at a line boundary, with a note saying where to continue. 0 turns it off. Empty: the Builder card's setting, else 24."
+    required: false
+    default: ""
+  compress_tool_output:
+    description: "Whether the runner compresses bash/grep/find tool output before sending it back to the model. The original stays on disk and can be retrieved with the `retrieve` tool. Empty: the Builder card's setting, else true enables it and false/0 turns it off."
+    required: false
+    default: ""
+  thinking:
+    description: "Whether the model reasons/thinks before tool actions. Empty or 'default': the Builder card's setting, else default disables thinking on Cruise lanes and DeepSeek models. 'off' disables thinking, 'on' leaves thinking enabled."
     required: false
     default: ""
   timeout_minutes:
@@ -106,6 +118,8 @@ runs:
         INPUT_WROKIN_API_BASE: ${{ inputs.wrokin_api_base }}
         INPUT_ROLE: ${{ inputs.role }}
         INPUT_READ_CAP_KB: ${{ inputs.read_cap_kb }}
+        INPUT_COMPRESS_TOOL_OUTPUT: ${{ inputs.compress_tool_output }}
+        INPUT_THINKING: ${{ inputs.thinking }}
       run: node "${{ steps.src.outputs.dir }}/checkin.mjs"
     - id: preflight
       shell: bash
@@ -118,20 +132,26 @@ runs:
       shell: bash
       run: node "${{ steps.src.outputs.dir }}/setup-pi.mjs"
     - id: run
-      if: inputs.issue_number != ''
+      if: inputs.issue_number != '' || inputs.pr_number != ''
       shell: bash
       env:
         INPUT_ROLE: ${{ inputs.role }}
         INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        INPUT_PR_NUMBER: ${{ inputs.pr_number }}
         INPUT_MODEL: ${{ steps.creds.outputs.model }}
         INPUT_CRUISE_BASE_URL: ${{ steps.creds.outputs.cruise_base_url }}
         INPUT_CRUISE_API_KEY: ${{ inputs.cruise_api_key || steps.creds.outputs.cruise_api_key }}
         INPUT_GITHUB_TOKEN: ${{ steps.creds.outputs.github_token || inputs.github_token }}
+        # A verified run reports its ready PR to wrok.in for auto-merge (#893), if it checked in.
+        INPUT_CHECKED_IN: ${{ inputs.cruise_api_key == '' }}
+        INPUT_WROKIN_API_BASE: ${{ inputs.wrokin_api_base }}
         INPUT_TEST_COMMAND: ${{ inputs.test_command }}
         INPUT_BASE_BRANCH: ${{ inputs.base_branch }}
         INPUT_CARD_BASE_BRANCH: ${{ steps.creds.outputs.card_base_branch }}
         INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         INPUT_READ_CAP_KB: ${{ steps.creds.outputs.read_cap_kb }}
+        INPUT_COMPRESS_TOOL_OUTPUT: ${{ steps.creds.outputs.compress_tool_output }}
+        INPUT_THINKING: ${{ steps.creds.outputs.thinking }}
         INPUT_PI: ${{ steps.setup.outputs.pi }}
         INPUT_AGENT_DIR: ${{ steps.setup.outputs.agent_dir }}
       run: node "${{ steps.src.outputs.dir }}/main.mjs"

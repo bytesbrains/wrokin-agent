@@ -14,6 +14,26 @@ export function installCommand(dir, exists = existsSync) {
   return null;
 }
 
+/** How long the install before the agent may take. Past it, the agent installs if it needs to. */
+export const PREINSTALL_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Installs dependencies before the agent starts (#865), so the typecheck gate and the
+ * agent's own test runs work from turn 1. A measured run spent its last two turns on
+ * `tsc: not found` and ended without a PR. Runs as the agent's user (`run`), since an
+ * install runs the repo's lifecycle scripts. Never fails the run: the agent can still
+ * install itself, and the proof-run installs again. `{ cmd, ok, note }`, or null when
+ * there is nothing to install.
+ */
+export async function preinstall({ dir, env, run, timeoutMs = PREINSTALL_TIMEOUT_MS }) {
+  const cmd = installCommand(dir);
+  if (!cmd) return null;
+  const r = await run(cmd, { cwd: dir, env, timeoutMs });
+  if (r.code === 0) return { cmd, ok: true, note: `\`${cmd}\` ran before the agent started` };
+  const why = r.timedOut ? "timed out" : `failed (exit ${r.code})`;
+  return { cmd, ok: false, note: `\`${cmd}\` ${why} before the agent started; the agent was told to install`, tail: r.tail };
+}
+
 /** npm's placeholder `test` script, which fails by design and proves nothing. */
 const NPM_PLACEHOLDER = /no test specified/i;
 

@@ -137,7 +137,8 @@ export function formatTopTools(tools = {}, limit = 3) {
  *
  * Also collects context-budget per-tool figures and quality guardrails (#860): result
  * bytes and calls per tool, failed edit calls, and in-loop gate rounds. Content is
- * discarded; only counts and sizes are kept.
+ * discarded; only counts and sizes are kept. `cacheRead` and `turns` show a run the
+ * provider didn't cache (#865, bytesbrains-cruise#662): see {@link cacheReadShare}.
  */
 export function summarize(jsonl) {
   const s = {
@@ -146,6 +147,8 @@ export function summarize(jsonl) {
     failedToolCalls: 0,
     input: 0,
     cached: 0,
+    cacheRead: 0,
+    turns: 0,
     output: 0,
     errors: [],
     cutoff: null,
@@ -179,6 +182,8 @@ export function summarize(jsonl) {
       if (text) s.finalText = text;
       s.input += e.message.usage?.input ?? 0;
       s.cached += (e.message.usage?.cacheRead ?? 0) + (e.message.usage?.cacheWrite ?? 0);
+      s.cacheRead += e.message.usage?.cacheRead ?? 0;
+      s.turns++;
       s.output += e.message.usage?.output ?? 0;
       const failed = e.message.stopReason === "error";
       if (failed && e.message.errorMessage) s.errors.push(e.message.errorMessage);
@@ -191,6 +196,26 @@ export function summarize(jsonl) {
   }
   return s;
 }
+
+/**
+ * The share of a run's input read from the provider's prompt cache, 0–1, or null when
+ * there was no input. A Builder run re-sends its whole history every turn, so a healthy
+ * run reads ~90% or more from cache; one pinned to a member that doesn't cache reads
+ * almost none and costs ~5× (#865, bytesbrains-cruise#662). pi's `usage.input` is the
+ * UNCACHED input only, with cache reads apart in `cacheRead` (measured: a turn reporting
+ * `input: 269, cacheRead: 11264`), so their sum is the whole prompt.
+ */
+export function cacheReadShare(s) {
+  const total = (s.input ?? 0) + (s.cacheRead ?? 0);
+  return total > 0 ? (s.cacheRead ?? 0) / total : null;
+}
+
+/** Where an uncached run is explained, named in the job summary's warning. */
+export const UNCACHED_ISSUE = "bytesbrains/bytesbrains-cruise#662";
+
+/** Below this share, over at least {@link UNCACHED_MIN_TURNS} turns, the summary flags the run. */
+export const UNCACHED_SHARE = 0.5;
+export const UNCACHED_MIN_TURNS = 4;
 
 export function summarizeFile(file) {
   try {

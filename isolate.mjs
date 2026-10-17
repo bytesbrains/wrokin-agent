@@ -18,8 +18,17 @@ import { SECRET_LIKE } from "./pi-config.mjs";
 /** The user pi runs as. */
 export const PI_USER = "wrokin-pi";
 
-/** Addresses pi never needs: cloud metadata (AWS/GCP/Azure) and Azure's wire server. */
-export const BLOCKED_DESTINATIONS = ["169.254.169.254", "168.63.129.16"];
+/**
+ * Addresses pi never needs: cloud metadata (AWS/GCP/Azure), Azure's wire server,
+ * and RFC 1918 private subnets (local LAN and runner host ports) (#847).
+ */
+export const BLOCKED_DESTINATIONS = [
+  "169.254.0.0/16",
+  "168.63.129.16",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+];
 
 export function cmd(file, args) {
   const r = spawnSync(file, args, { encoding: "utf8" });
@@ -107,9 +116,11 @@ export function prepare({
 }
 
 /**
- * Rejects the agent user's traffic to {@link BLOCKED_DESTINATIONS}, the runner's own
- * traffic untouched. Best effort: our self-hosted images have no iptables yet, and
- * the isolation above doesn't depend on it.
+ * Rejects the agent user's traffic to {@link BLOCKED_DESTINATIONS}, while allowing DNS
+ * queries (UDP/TCP 53) so resolution succeeds even when nameservers reside in private
+ * subnets (e.g. AWS VPC resolver 10.0.0.2 or local router). The runner's own traffic is
+ * untouched. Best effort: our self-hosted images support this with NET_ADMIN, and the
+ * user isolation above doesn't depend on it.
  */
 export function blockDestinations({ run = cmd } = {}) {
   const blocked = [];
@@ -121,10 +132,21 @@ export function blockDestinations({ run = cmd } = {}) {
       blocked.push(dest);
     }
   }
+
+  // Allow DNS queries ahead of destination rejects so resolution succeeds even if a
+  // nameserver resides in a private subnet. Inserting at position 1 ensures it evaluates
+  // before the destination rejects.
+  for (const proto of ["udp", "tcp"]) {
+    const rule = ["OUTPUT", "-m", "owner", "--uid-owner", PI_USER, "-p", proto, "--dport", "53", "-j", "ACCEPT"];
+    if (sudo(run, ["iptables", "-C", ...rule]).code !== 0) {
+      sudo(run, ["iptables", "-I", ...rule]);
+    }
+  }
+
   console.log(
     blocked.length === BLOCKED_DESTINATIONS.length
       ? `blocked ${blocked.join(", ")} for ${PI_USER}`
-      : `no iptables on this runner: ${PI_USER} can reach cloud metadata endpoints`,
+      : `no iptables on this runner: ${PI_USER} can reach internal and cloud metadata endpoints`,
   );
   return blocked;
 }

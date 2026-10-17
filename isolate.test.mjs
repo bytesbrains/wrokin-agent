@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PI_USER, ancestors, asPiUser, blockDestinations, cleanUp, prepare, reclaim, restoreLocalAction } from "./isolate.mjs";
+import { BLOCKED_DESTINATIONS, PI_USER, ancestors, asPiUser, blockDestinations, cleanUp, prepare, reclaim, restoreLocalAction } from "./isolate.mjs";
 
 /**
  * A fake command runner: `answers` maps "file arg arg…" prefixes to an exit code, and
@@ -103,15 +103,21 @@ describe("prepare: the working path", () => {
 describe("blockDestinations", () => {
   const rule = (dest) => `OUTPUT -m owner --uid-owner ${PI_USER} -d ${dest} -j REJECT`;
 
-  it("inserts a rule that isn't there yet", () => {
+  it("inserts a rule that isn't there yet, plus DNS allow rules", () => {
     const { run, calls } = fakeRun({ "sudo -n iptables -C": 1 });
-    expect(blockDestinations({ run })).toEqual(["169.254.169.254", "168.63.129.16"]);
-    expect(calls).toContain(`sudo -n iptables -I ${rule("169.254.169.254")}`);
+    expect(blockDestinations({ run })).toEqual(BLOCKED_DESTINATIONS);
+    expect(calls).toContain(`sudo -n iptables -I ${rule("169.254.0.0/16")}`);
+    expect(calls).toContain(`sudo -n iptables -I ${rule("168.63.129.16")}`);
+    expect(calls).toContain(`sudo -n iptables -I ${rule("10.0.0.0/8")}`);
+    expect(calls).toContain(`sudo -n iptables -I ${rule("172.16.0.0/12")}`);
+    expect(calls).toContain(`sudo -n iptables -I ${rule("192.168.0.0/16")}`);
+    expect(calls).toContain(`sudo -n iptables -I OUTPUT -m owner --uid-owner ${PI_USER} -p udp --dport 53 -j ACCEPT`);
+    expect(calls).toContain(`sudo -n iptables -I OUTPUT -m owner --uid-owner ${PI_USER} -p tcp --dport 53 -j ACCEPT`);
   });
 
   it("doesn't insert it again on a runner that kept it from an earlier job", () => {
     const { run, calls } = fakeRun();
-    expect(blockDestinations({ run })).toEqual(["169.254.169.254", "168.63.129.16"]);
+    expect(blockDestinations({ run })).toEqual(BLOCKED_DESTINATIONS);
     expect(calls.filter((c) => c.includes("iptables -I"))).toEqual([]);
   });
 });

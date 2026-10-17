@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { AUDIENCE, checkin, readInputs, requestOidc, resolve } from "./checkin.mjs";
+import { AUDIENCE, checkin, readInputs, reportVerified, requestOidc, resolve } from "./checkin.mjs";
 
 const KEY = "cru_live_decoy_key_9f3a";
 const GH = "ghs_decoy_repo_token_41c7";
@@ -23,14 +23,14 @@ describe("resolve (#813)", () => {
     const fetchFn = vi.fn();
     const r = await resolve({ INPUT_CRUISE_API_KEY: KEY, ...OIDC_ENV }, { fetchFn });
     expect(fetchFn).not.toHaveBeenCalled();
-    expect(r).toEqual({ model: "bb/builder", baseUrl: "https://cruise.bytesbrains.net/v1", readCapKb: "", baseBranch: "" });
+    expect(r).toEqual({ model: "bb/builder", baseUrl: "https://cruise.bytesbrains.net/v1", readCapKb: "", baseBranch: "", compressToolOutput: "", thinking: "" });
   });
 
   it("fetches the card's key, lane and URL, and masks the key before returning it", async () => {
     const fetchFn = fakeFetch();
     const log = vi.fn();
     const r = await resolve({ ...OIDC_ENV }, { fetchFn, log });
-    expect(r).toEqual({ key: KEY, githubToken: GH, model: "bb/builder-fast", baseUrl: "https://cruise.example/v1", readCapKb: "", baseBranch: "" });
+    expect(r).toEqual({ key: KEY, githubToken: GH, model: "bb/builder-fast", baseUrl: "https://cruise.example/v1", readCapKb: "", baseBranch: "", compressToolOutput: "", thinking: "" });
     expect(log).toHaveBeenCalledWith(`::add-mask::${KEY}`);
 
     const [oidcUrl, oidcInit] = fetchFn.mock.calls[0];
@@ -75,6 +75,36 @@ describe("resolve (#813)", () => {
     // A line break would write an output of its own: the whole check-in is refused.
     expect((await resolve({ ...OIDC_ENV }, { fetchFn: card("dev\ncruise_api_key=x"), log: () => {} })).error).toMatch(/malformed/);
     expect(await base({ INPUT_CRUISE_API_KEY: KEY }, vi.fn())).toBe("");
+  });
+
+  // #864: tool output compression (boolean string); empty input defers to the card.
+  it("takes the card's tool output compression unless the workflow sets one", async () => {
+    const card = (compress_tool_output) => fakeFetch(200, { cruise_api_key: KEY, compress_tool_output });
+    const comp = async (env, fetchFn) =>
+      (await resolve({ ...OIDC_ENV, ...env }, { fetchFn, log: () => {} })).compressToolOutput;
+    expect(await comp({}, card(true))).toBe("true");
+    expect(await comp({}, card(false))).toBe("false");
+    expect(await comp({ INPUT_COMPRESS_TOOL_OUTPUT: "false" }, card(true))).toBe("false");
+    expect(await comp({ INPUT_COMPRESS_TOOL_OUTPUT: "0" }, card(true))).toBe("0");
+    expect(await comp({ INPUT_COMPRESS_TOOL_OUTPUT: "true" }, card(false))).toBe("true");
+    // An older wrok.in or missing: empty string so compress-output.mjs applies default
+    expect(await comp({}, card(undefined))).toBe("");
+    expect(await comp({ INPUT_CRUISE_API_KEY: KEY, INPUT_COMPRESS_TOOL_OUTPUT: "false" }, vi.fn())).toBe("false");
+  });
+
+  // #865: thinking setting ("default" | "off" | "on"); empty input defers to the card.
+  it("takes the card's thinking setting unless the workflow sets one", async () => {
+    const card = (thinking) => fakeFetch(200, { cruise_api_key: KEY, thinking });
+    const think = async (env, fetchFn) =>
+      (await resolve({ ...OIDC_ENV, ...env }, { fetchFn, log: () => {} })).thinking;
+    expect(await think({}, card("off"))).toBe("off");
+    expect(await think({}, card("on"))).toBe("on");
+    expect(await think({}, card("default"))).toBe("default");
+    expect(await think({ INPUT_THINKING: "off" }, card("on"))).toBe("off");
+    expect(await think({ INPUT_THINKING: "on" }, card("off"))).toBe("on");
+    // An older wrok.in or missing: empty string so pi-config.mjs applies default
+    expect(await think({}, card(undefined))).toBe("");
+    expect(await think({ INPUT_CRUISE_API_KEY: KEY, INPUT_THINKING: "off" }, vi.fn())).toBe("off");
   });
 
   it("falls back to the default lane when the card names none", async () => {
@@ -201,9 +231,40 @@ describe("checkin", () => {
   });
 });
 
+describe("reportVerified (#893)", () => {
+  const SHA = "a".repeat(40);
+
+  it("posts the PR and its head sha with a fresh OIDC token for the agent audience", async () => {
+    const fetchFn = fakeFetch(200, { recorded: true });
+    const r = await reportVerified(OIDC_ENV, { apiBase: "https://api.wrok.in/", pr: 9, headSha: SHA, fetchFn });
+    expect(r).toEqual({ ok: true });
+    expect(fetchFn.mock.calls[0][0]).toContain(`audience=${AUDIENCE}`);
+    const [url, init] = fetchFn.mock.calls[1];
+    expect(url).toBe("https://api.wrok.in/agent/verified");
+    expect(JSON.parse(init.body)).toEqual({ oidc: "oidc-jwt", pr: 9, head_sha: SHA });
+  });
+
+  it("says why wrok.in refused", async () => {
+    const r = await reportVerified(OIDC_ENV, {
+      apiBase: "https://x",
+      pr: 9,
+      headSha: SHA,
+      fetchFn: fakeFetch(409, { error: "the PR's head has moved past this run" }),
+    });
+    expect(r.error).toBe("wrok.in refused (HTTP 409): the PR's head has moved past this run");
+  });
+
+  it("needs an OIDC token and an https base", async () => {
+    expect((await reportVerified({}, { apiBase: "https://x", pr: 9, headSha: SHA, fetchFn: vi.fn() })).error).toMatch(/id-token/);
+    const fetchFn = vi.fn();
+    expect((await reportVerified(OIDC_ENV, { apiBase: "http://x", pr: 9, headSha: SHA, fetchFn })).error).toMatch(/https/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
 describe("readInputs (#814 review)", () => {
   it("defaults the API base and role, and treats unset inputs as empty", () => {
-    expect(readInputs({})).toEqual({ key: "", model: "", baseUrl: "", readCapKb: "", apiBase: "https://api.wrok.in", role: "builder" });
+    expect(readInputs({})).toEqual({ key: "", model: "", baseUrl: "", readCapKb: "", compressToolOutput: "", thinking: "", apiBase: "https://api.wrok.in", role: "builder" });
   });
 
   it("checks in at a wrokin_api_base override", async () => {

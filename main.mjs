@@ -11,7 +11,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { client, fetchIssue, taskMarkdown } from "./github.mjs";
+import { reportVerified } from "./checkin.mjs";
+import { client, fetchIssue, fetchPR, prTaskMarkdown, taskMarkdown } from "./github.mjs";
 import {
   baseFromDocs,
   checkCommands,
@@ -24,9 +25,9 @@ import {
   resolveBase,
   runPrompt,
 } from "./context.mjs";
-import { modelsJson, piEnv, scrubbedEnv, wantsThinkingSwitch } from "./pi-config.mjs";
+import { modelsJson, piEnv, resolveThinking, scrubbedEnv, wantsThinkingSwitch } from "./pi-config.mjs";
 import { formatTopTools, piArgs, runPi, summarizeFile } from "./run-pi.mjs";
-import { sh, verify } from "./verify.mjs";
+import { preinstall, sh, verify } from "./verify.mjs";
 import { changedCheckConfigs, unpushedCheckConfigs, withConfigChanges } from "./check-configs.mjs";
 import { asPiUser, cleanUp, killPiProcesses, piHome, prepare, reclaim, restoreLocalAction } from "./isolate.mjs";
 import {
@@ -64,23 +65,33 @@ const gitAsPi = (args, { cwd, env }) => {
   const r = spawnSync(w.file, w.args, { cwd, env: w.env, encoding: "utf8" });
   return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 };
-const ROLES = new Set(["builder"]);
+const ROLES = new Set(["builder", "builder-fix"]);
 
 export function readInputs(env) {
   const parsed = Number.parseInt(env.INPUT_TIMEOUT_MINUTES ?? "", 10);
   // Parsed once: the limit the agent is told and the one enforced can't drift apart.
   const minutes = Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+  const issueParsed = Number.parseInt(env.INPUT_ISSUE_NUMBER ?? "", 10);
+  const prParsed = Number.parseInt(env.INPUT_PR_NUMBER ?? "", 10);
+  const issue = Number.isInteger(issueParsed) && issueParsed > 0 ? issueParsed : null;
+  const pr = Number.isInteger(prParsed) && prParsed > 0 ? prParsed : null;
+  const defaultRole = pr && !issue ? "builder-fix" : "builder";
   return {
-    role: env.INPUT_ROLE || "builder",
-    issue: Number.parseInt(env.INPUT_ISSUE_NUMBER ?? "", 10),
+    role: env.INPUT_ROLE || defaultRole,
+    issue,
+    pr,
     model: env.INPUT_MODEL,
     baseUrl: env.INPUT_CRUISE_BASE_URL,
     cruiseKey: env.INPUT_CRUISE_API_KEY,
     token: env.INPUT_GITHUB_TOKEN,
+    // Only a run that checked in reports to wrok.in; one given a cruise_api_key never calls it.
+    checkedIn: env.INPUT_CHECKED_IN === "true",
+    apiBase: env.INPUT_WROKIN_API_BASE || "https://api.wrok.in",
     testCommand: env.INPUT_TEST_COMMAND ?? "",
     baseBranch: env.INPUT_BASE_BRANCH ?? "",
     cardBaseBranch: env.INPUT_CARD_BASE_BRANCH ?? "",
     readCapKb: env.INPUT_READ_CAP_KB ?? "",
+    thinking: env.INPUT_THINKING ?? "",
     minutes,
     timeoutMs: minutes * 60_000,
     pi: env.INPUT_PI,
@@ -100,83 +111,144 @@ export function readInputs(env) {
 export const verifyBudget = (agentMs) => Math.min(agentMs, 20 * 60_000);
 
 async function comment(gh, i, body) {
-  await gh.call("POST", `/repos/${i.repo}/issues/${i.issue}/comments`, { body });
+  const target = i.pr ?? i.issue;
+  if (!target) return;
+  await gh.call("POST", `/repos/${i.repo}/issues/${target}/comments`, { body });
 }
 
 export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN)) {
   const i = readInputs(env);
-  if (!Number.isInteger(i.issue) || i.issue < 1) return console.log("::error::issue_number is required");
+  if (!i.issue && !i.pr) return console.log("::error::issue_number or pr_number is required");
+  if (i.issue && i.pr) {
+    console.log("::error::pass either issue_number or pr_number, not both");
+    return comment(gh, i, `⚠️ wrokin Builder couldn't start: pass either issue_number or pr_number, not both. [Run](${i.runUrl})`);
+  }
   if (!ROLES.has(i.role)) {
     console.log(`::error::unknown role "${i.role}"`);
     return comment(gh, i, `⚠️ wrokin Builder couldn't start: unknown role \`${i.role}\`. [Run](${i.runUrl})`);
   }
 
-  const ctx = await fetchIssue(gh, i.repo, i.issue);
-  if (ctx.error) {
-    // Unreadable issue: try the comment anyway (a PR number is readable, for one).
-    console.log(`::error::${ctx.error}`);
-    return comment(gh, i, `⚠️ wrokin Builder couldn't start: ${ctx.error}. [Run](${i.runUrl})`);
-  }
-
-  mkdirSync(i.temp, { recursive: true });
-  const taskFile = join(i.temp, "task.md");
-  writeFileSync(taskFile, taskMarkdown(i.repo, ctx.issue, ctx.comments));
-  writeFileSync(join(i.agentDir, "models.json"), JSON.stringify(modelsJson(i.model, i.baseUrl), null, 2));
-
-  // Work on our own branch in the job's checkout, after removing every credential
-  // checkout left behind, so nothing pi runs can push with, or read, the job's token.
+  let ctx;
+  let branch;
+  let base;
+  let baseInfo;
+  let setup;
   const gitEnv = scrubbedEnv(env);
-  const branch = branchName(i.role, i.issue, i.runId);
-  const dropped = dropCheckoutCredentials({ cwd: i.workspace, env: gitEnv, runnerTemp: env.RUNNER_TEMP });
-  if (dropped.length) console.log(`removed checkout credentials before pi: ${dropped.join(", ")}`);
-  excludeAgentLogs({ cwd: i.workspace, env: gitEnv });
 
-  // The base (#855): the dispatch always runs on the default branch, which is not where
-  // every repo integrates. Start from the resolved base, else stay on what was checked out.
-  const checkedOut = env.GITHUB_REF_NAME;
-  const history = i.baseBranch || i.cardBaseBranch ? { prs: [] } : await recentMergedPrs(gh, i.repo);
-  // Read on the checked-out (default) branch: that is where a repo states its rules.
-  let baseInfo = resolveBase({
-    input: i.baseBranch,
-    card: i.cardBaseBranch,
-    docs: baseFromDocs(readGuidelines(i.workspace)),
-    defaultBranch: (await gh.call("GET", `/repos/${i.repo}`)).data?.default_branch || checkedOut,
-    mergedPrs: history.prs,
-    listError: history.error,
-  });
-  let start = "HEAD";
-  if (baseInfo.branch !== checkedOut) {
-    const sha = fetchBase({ cwd: i.workspace, env: gitEnv, repo: i.repo, branch: baseInfo.branch, token: i.token });
-    if (sha) start = sha;
-    else baseInfo = { branch: checkedOut, why: `\`${baseInfo.branch}\` (${baseInfo.why}) couldn't be fetched, so the checked-out branch` };
-  }
-  console.log(`base: ${baseInfo.branch} — ${baseInfo.why}`);
-  const co = git(["checkout", "-b", branch, start], { cwd: i.workspace, env: gitEnv });
-  if (co.code !== 0) {
-    return comment(gh, i, `⚠️ wrokin Builder couldn't start: \`git checkout\` failed. [Run](${i.runUrl})`);
-  }
-  const base = git(["rev-parse", "HEAD"], { cwd: i.workspace, env: gitEnv }).out;
+  if (i.pr) {
+    ctx = await fetchPR(gh, i.repo, i.pr);
+    if (ctx.error) {
+      console.log(`::error::${ctx.error}`);
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: ${ctx.error}. [Run](${i.runUrl})`);
+    }
 
-  // Read while the checkout is still the runner's, before the agent can change any of it.
-  const issueText = [ctx.issue.title, ctx.issue.body ?? ""].join("\n");
-  const setup = {
-    base: baseInfo,
-    checks: checkCommands(i.workspace, i.testCommand),
-    premises: checkPremises({ text: issueText, cwd: i.workspace, env: gitEnv, base }),
-    guidelines: readGuidelines(i.workspace),
-  };
-  if (premiseStop(setup.premises, ctx.issue.labels)) {
-    console.log(`::warning title=wrokin-agent premises::missing on ${baseInfo.branch}: ${setup.premises.missing.join(", ")}`);
-    return comment(gh, i, premiseStopComment({ premises: setup.premises, base: baseInfo, runUrl: i.runUrl }));
+    branch = ctx.pr.head?.ref;
+    if (!branch) {
+      console.log("::error::the PR's head branch is missing");
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: the PR's head branch is missing. [Run](${i.runUrl})`);
+    }
+    if (ctx.pr.head?.repo?.full_name && ctx.pr.head.repo.full_name !== i.repo) {
+      console.log(`::error::fork PRs not supported (${ctx.pr.head.repo.full_name})`);
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: PRs from forks are not supported by the Fix agent. [Run](${i.runUrl})`);
+    }
+    if (branch.startsWith("-") || /\s|\.\.|@\{|[\x00-\x1f]/.test(branch)) {
+      console.log(`::error::invalid head ref: ${branch}`);
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: invalid head branch name \`${branch}\`. [Run](${i.runUrl})`);
+    }
+
+    mkdirSync(i.temp, { recursive: true });
+    const taskFile = join(i.temp, "task.md");
+    writeFileSync(taskFile, prTaskMarkdown(i.repo, ctx.pr, ctx));
+    writeFileSync(join(i.agentDir, "models.json"), JSON.stringify(modelsJson(i.model, i.baseUrl), null, 2));
+
+    const dropped = dropCheckoutCredentials({ cwd: i.workspace, env: gitEnv, runnerTemp: env.RUNNER_TEMP });
+    if (dropped.length) console.log(`removed checkout credentials before pi: ${dropped.join(", ")}`);
+    excludeAgentLogs({ cwd: i.workspace, env: gitEnv });
+
+    const fetchRes = git(["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { cwd: i.workspace, env: gitEnv });
+    if (fetchRes.code !== 0) {
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: \`git fetch origin ${branch}\` failed. [Run](${i.runUrl})`);
+    }
+    const co = git(["checkout", "-B", branch, `origin/${branch}`], { cwd: i.workspace, env: gitEnv });
+    if (co.code !== 0) {
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: \`git checkout ${branch}\` failed. [Run](${i.runUrl})`);
+    }
+    base = git(["rev-parse", "HEAD"], { cwd: i.workspace, env: gitEnv }).out;
+    baseInfo = { branch: ctx.pr.base?.ref ?? "main", why: "the PR's base branch" };
+    // On PR rework, checkPremises is not applied: review comments and checks routinely
+    // mention deleted files, proposed new files, or hypothetical alternatives, which
+    // would falsely trigger a premise stop on legitimate fixes.
+    setup = {
+      base: baseInfo,
+      checks: checkCommands(i.workspace, i.testCommand),
+      premises: { missing: [], checked: 0 },
+      guidelines: readGuidelines(i.workspace),
+    };
+  } else {
+    ctx = await fetchIssue(gh, i.repo, i.issue);
+    if (ctx.error) {
+      // Unreadable issue: try the comment anyway (a PR number is readable, for one).
+      console.log(`::error::${ctx.error}`);
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: ${ctx.error}. [Run](${i.runUrl})`);
+    }
+
+    mkdirSync(i.temp, { recursive: true });
+    const taskFile = join(i.temp, "task.md");
+    writeFileSync(taskFile, taskMarkdown(i.repo, ctx.issue, ctx.comments));
+    writeFileSync(join(i.agentDir, "models.json"), JSON.stringify(modelsJson(i.model, i.baseUrl), null, 2));
+
+    // Work on our own branch in the job's checkout, after removing every credential
+    // checkout left behind, so nothing pi runs can push with, or read, the job's token.
+    branch = branchName(i.role, i.issue, i.runId);
+    const dropped = dropCheckoutCredentials({ cwd: i.workspace, env: gitEnv, runnerTemp: env.RUNNER_TEMP });
+    if (dropped.length) console.log(`removed checkout credentials before pi: ${dropped.join(", ")}`);
+    excludeAgentLogs({ cwd: i.workspace, env: gitEnv });
+
+    // The base (#855): the dispatch always runs on the default branch, which is not where
+    // every repo integrates. Start from the resolved base, else stay on what was checked out.
+    const checkedOut = env.GITHUB_REF_NAME;
+    const history = i.baseBranch || i.cardBaseBranch ? { prs: [] } : await recentMergedPrs(gh, i.repo);
+    // Read on the checked-out (default) branch: that is where a repo states its rules.
+    baseInfo = resolveBase({
+      input: i.baseBranch,
+      card: i.cardBaseBranch,
+      docs: baseFromDocs(readGuidelines(i.workspace)),
+      defaultBranch: (await gh.call("GET", `/repos/${i.repo}`)).data?.default_branch || checkedOut,
+      mergedPrs: history.prs,
+      listError: history.error,
+    });
+    let start = "HEAD";
+    if (baseInfo.branch !== checkedOut) {
+      const sha = fetchBase({ cwd: i.workspace, env: gitEnv, repo: i.repo, branch: baseInfo.branch, token: i.token });
+      if (sha) start = sha;
+      else baseInfo = { branch: checkedOut, why: `\`${baseInfo.branch}\` (${baseInfo.why}) couldn't be fetched, so the checked-out branch` };
+    }
+    console.log(`base: ${baseInfo.branch} — ${baseInfo.why}`);
+    const co = git(["checkout", "-b", branch, start], { cwd: i.workspace, env: gitEnv });
+    if (co.code !== 0) {
+      return comment(gh, i, `⚠️ wrokin Builder couldn't start: \`git checkout\` failed. [Run](${i.runUrl})`);
+    }
+    base = git(["rev-parse", "HEAD"], { cwd: i.workspace, env: gitEnv }).out;
+
+    // Read while the checkout is still the runner's, before the agent can change any of it.
+    const issueText = [ctx.issue.title, ctx.issue.body ?? ""].join("\n");
+    setup = {
+      base: baseInfo,
+      checks: checkCommands(i.workspace, i.testCommand),
+      premises: checkPremises({ text: issueText, cwd: i.workspace, env: gitEnv, base }),
+      guidelines: readGuidelines(i.workspace),
+    };
+    if (premiseStop(setup.premises, ctx.issue.labels)) {
+      console.log(`::warning title=wrokin-agent premises::missing on ${baseInfo.branch}: ${setup.premises.missing.join(", ")}`);
+      return comment(gh, i, premiseStopComment({ premises: setup.premises, base: baseInfo, runUrl: i.runUrl }));
+    }
   }
   // The typecheck the in-loop gate runs (check-gate.mjs), fixed before the agent starts.
   const checksFile = join(i.temp, "run-checks.json");
-  writeFileSync(checksFile, JSON.stringify({ typecheck: setup.checks.typecheck, scripts: setup.checks.scripts }));
+  writeFileSync(checksFile, JSON.stringify({ typecheck: setup.checks.typecheck, scripts: setup.checks.scripts, base }));
   const promptFile = join(i.temp, "run-prompt.md");
-  writeFileSync(
-    promptFile,
-    runPrompt({ role: readFileSync(join(here, "roles", `${i.role}.md`), "utf8"), minutes: i.minutes, ...setup }),
-  );
+  const rolePrompt = readFileSync(join(here, "roles", `${i.role}.md`), "utf8");
+  writeFileSync(promptFile, runPrompt({ role: rolePrompt, minutes: i.minutes, ...setup }));
 
   // Hand the checkout to the agent's user, or run nothing (#832: fail closed).
   const home = piHome(i.temp);
@@ -196,6 +268,17 @@ export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN
     );
   }
   try {
+    // Dependencies first, as the agent's user: an install runs the repo's own scripts
+    // (#865). The prompt is rewritten with the outcome before pi reads it.
+    const deps = await preinstall({
+      dir: i.workspace,
+      env: { ...gitEnv, HOME: home },
+      run: (cmd, opts) => sh(cmd, { ...opts, spawnFn: spawnAsPi }),
+    });
+    if (deps) {
+      console.log(deps.ok ? deps.note : `::warning title=wrokin-agent install::${deps.note}`);
+      writeFileSync(promptFile, runPrompt({ role: rolePrompt, minutes: i.minutes, ...setup, deps }));
+    }
     return await agentRun(gh, i, { ctx, base, baseRef: baseInfo.branch, branch, taskFile, promptFile, checksFile, setup, home, env, gitEnv });
   } finally {
     // Nothing the agent started outlives the run, its logs leave the checkout as plain
@@ -221,14 +304,15 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
       model: i.model,
       rolePrompt: promptFile,
       taskFile,
-      thinking: wantsThinkingSwitch(i.model),
-      extensions: [join(here, "check-gate.mjs"), join(here, "read-cap.mjs")],
+      thinking: resolveThinking(i.thinking, i.model),
+      extensions: [join(here, "check-gate.mjs"), join(here, "read-cap.mjs"), join(here, "compress-output.mjs")],
     }),
     env: {
       ...piEnv(env, { agentDir: i.agentDir, cruiseKey: i.cruiseKey, session: `wrokin-${i.runId}` }),
       HOME: home,
       WROKIN_CHECKS_FILE: checksFile,
       WROKIN_READ_CAP_KB: i.readCapKb,
+      WROKIN_COMPRESS_TOOL_OUTPUT: env.INPUT_COMPRESS_TOOL_OUTPUT ?? "",
     },
     cwd: i.workspace,
     eventsFile,
@@ -265,6 +349,14 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
     dir: join(i.temp, "publish.git"),
     env: gitEnv,
   });
+  const top = formatTopTools(s.tools);
+  const extra = [];
+  if (top) extra.push(top);
+  if (s.failedEdits) extra.push(`${s.failedEdits} failed edit${s.failedEdits === 1 ? "" : "s"}`);
+  if (s.gateRounds) extra.push(`${s.gateRounds} gate round${s.gateRounds === 1 ? "" : "s"}`);
+  if (s.cappedReads) extra.push(`${s.cappedReads} capped read${s.cappedReads === 1 ? "" : "s"}`);
+  const footerExtra = extra.length ? ` · ${extra.join(" · ")}` : "";
+
   if (commits === 0) {
     recordJobSummary(
       buildJobSummary({ summary: s, result: null, ready: false, runId: i.runId, model: i.model }),
@@ -279,17 +371,12 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
         : s.errors.length
           ? `the model call failed: ${s.errors.at(-1).slice(0, 300)}`
           : "it made no changes";
-    const top = formatTopTools(s.tools);
-    const extra = [];
-    if (top) extra.push(top);
-    if (s.failedEdits) extra.push(`${s.failedEdits} failed edit${s.failedEdits === 1 ? "" : "s"}`);
-    if (s.gateRounds) extra.push(`${s.gateRounds} gate round${s.gateRounds === 1 ? "" : "s"}`);
-    if (s.cappedReads) extra.push(`${s.cappedReads} capped read${s.cappedReads === 1 ? "" : "s"}`);
-    const footerExtra = extra.length ? ` · ${extra.join(" · ")}` : "";
+    const agentName = i.pr ? "wrokin Builder Fix" : "wrokin Builder";
+    const actionDesc = i.pr ? "didn't make changes on this PR" : "didn't open a PR for this issue";
     return comment(
       gh,
       i,
-      `wrokin Builder didn't open a PR for this issue: ${why}.\n\n` +
+      `${agentName} ${actionDesc}: ${why}.\n\n` +
         (s.finalText ? `**What it said:**\n\n${s.finalText.slice(0, 3000)}\n\n` : "") +
         `<sub>${i.model} via Cruise${footerExtra} · [run](${i.runUrl})</sub>`,
     );
@@ -326,6 +413,32 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
   const fallback = s.finalText
     ? null
     : generatedSummary({ commits: describeCommits({ dir: publishDir, base, branch, env: gitEnv }), result, cutoff });
+  const ready = isReady(result, cutoff);
+  recordJobSummary(
+    buildJobSummary({ summary: s, result, ready, runId: i.runId, model: i.model }),
+    env.GITHUB_STEP_SUMMARY,
+  );
+  const tests = result.verified ? "✅ verified: the tests pass" : `⚠️ not verified: ${result.reason}`;
+  // The cutoff leads: it is why the work is partial, and the test result only follows from it.
+  const verdict = cutoff ? `⛔ cut off before the agent finished: ${cutoffReason(cutoff)}; ${tests}` : tests;
+
+  if (i.pr) {
+    if (ready && i.checkedIn) {
+      const headSha = pushed.sha ?? git(["rev-parse", "HEAD"], { cwd: publishDir, env: gitEnv }).out;
+      const rep = await reportVerified(env, { apiBase: i.apiBase, pr: i.pr, headSha });
+      if (rep.error) console.log(`::warning title=wrokin-agent verified record::${rep.error} PR #${i.pr} won't auto-merge.`);
+      else console.log(`recorded PR #${i.pr} as verified at ${headSha.slice(0, 12)}`);
+    }
+    const summaryText = s.finalText ? s.finalText : (fallback?.summary ?? "");
+    return comment(
+      gh,
+      i,
+      `wrokin Builder Fix pushed fixes to \`${branch}\` (${verdict}).\n\n` +
+        (summaryText ? `${summaryText}\n\n` : "") +
+        `<sub>${i.model} via Cruise${footerExtra} · [run](${i.runUrl})</sub>`,
+    );
+  }
+
   const body = prBody({
     issue: i.issue,
     summary: s.finalText,
@@ -337,11 +450,6 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
     setup: { ...setup, guidelines: setup.guidelines.map((g) => g.path), changedConfigs, unpushedConfigs },
     fallback,
   });
-  const ready = isReady(result, cutoff);
-  recordJobSummary(
-    buildJobSummary({ summary: s, result, ready, runId: i.runId, model: i.model }),
-    env.GITHUB_STEP_SUMMARY,
-  );
   const pr = await openPr(gh, {
     repo: i.repo,
     base: baseRef,
@@ -350,10 +458,13 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
     body,
     draft: !ready,
   });
-  const tests = result.verified ? "✅ verified: the tests pass" : `⚠️ not verified: ${result.reason}`;
-  // The cutoff leads: it is why the work is partial, and the test result only follows from it.
-  const verdict = cutoff ? `⛔ cut off before the agent finished: ${cutoffReason(cutoff)}; ${tests}` : tests;
   if (pr.ok) {
+    // The record auto-merge requires (#893). Failing it only keeps the PR from merging itself.
+    if (ready && i.checkedIn) {
+      const rep = await reportVerified(env, { apiBase: i.apiBase, pr: pr.number, headSha: pr.headSha });
+      if (rep.error) console.log(`::warning title=wrokin-agent verified record::${rep.error} PR #${pr.number} won't auto-merge.`);
+      else console.log(`recorded PR #${pr.number} as verified at ${pr.headSha.slice(0, 12)}`);
+    }
     return comment(gh, i, `wrokin Builder opened ${ready ? "" : "a draft "}PR #${pr.number}, ${verdict}.`);
   }
   return comment(

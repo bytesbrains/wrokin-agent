@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installCommand, testCommand, verify } from "./verify.mjs";
+import { installCommand, preinstall, testCommand, verify } from "./verify.mjs";
 
 // The proof-run (#805, #855, #858): split out of publish.test.mjs (#891).
 describe("verify: commands", () => {
@@ -180,5 +180,41 @@ describe("verify: verdict", () => {
     expect(bad).toMatchObject({ verified: false, reason: "`t` failed (exit 1)" });
     const none = await verify({ dir, override: "", env: {}, timeoutMs: 1000, run: async () => ({ code: 0 }) });
     expect(none).toEqual({ verified: false, reason: "no test command found", proof: null });
+  });
+});
+
+// #865: a measured run spent its last turns on `tsc: not found` and opened no PR.
+describe("preinstall (#865)", () => {
+  const withLock = (fn) => async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-pre-"));
+    try {
+      writeFileSync(join(dir, "package-lock.json"), "{}");
+      await fn(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("runs the lockfile's install, in the checkout, through the given runner", withLock(async (dir) => {
+    const calls = [];
+    const r = await preinstall({ dir, env: { A: "1" }, run: async (cmd, o) => (calls.push([cmd, o.cwd, o.env.A]), { code: 0, tail: "" }) });
+    expect(calls).toEqual([["npm ci", dir, "1"]]);
+    expect(r).toEqual({ cmd: "npm ci", ok: true, note: "`npm ci` ran before the agent started" });
+  }));
+
+  it("reports a failed or timed-out install without throwing", withLock(async (dir) => {
+    const failed = await preinstall({ dir, env: {}, run: async () => ({ code: 1, tail: "E404" }) });
+    expect(failed).toMatchObject({ cmd: "npm ci", ok: false, tail: "E404" });
+    expect(failed.note).toContain("failed (exit 1)");
+    const slow = await preinstall({ dir, env: {}, run: async () => ({ code: null, timedOut: true, tail: "" }) });
+    expect(slow.note).toContain("timed out");
+  }));
+
+  it("does nothing when there is nothing to install", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-pre-"));
+    let ran = false;
+    expect(await preinstall({ dir, env: {}, run: async () => ((ran = true), { code: 0 }) })).toBeNull();
+    expect(ran).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { modelsJson, piEnv, scrubbedEnv, wantsThinkingSwitch } from "./pi-config.mjs";
-import { errorCode, formatBytes, formatTopTools, piArgs, summarize, toolBytes } from "./run-pi.mjs";
-import { client, fetchIssue, taskMarkdown } from "./github.mjs";
+import { modelsJson, piEnv, resolveThinking, scrubbedEnv, wantsThinkingSwitch } from "./pi-config.mjs";
+import { cacheReadShare, errorCode, formatBytes, formatTopTools, piArgs, summarize, toolBytes, UNCACHED_ISSUE, UNCACHED_SHARE } from "./run-pi.mjs";
+import { buildJobSummary } from "./publish.mjs";
+import { client, fetchIssue, fetchPR, prTaskMarkdown, taskMarkdown } from "./github.mjs";
 import { failureComment } from "./report-failure.mjs";
 
 describe("pi-config", () => {
@@ -12,6 +13,18 @@ describe("pi-config", () => {
     expect(wantsThinkingSwitch("workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813")).toBe(true);
     expect(wantsThinkingSwitch("mistral/codestral-2508")).toBe(false);
     expect(wantsThinkingSwitch("openai/gpt-6-astra")).toBe(false);
+  });
+
+  it("resolves thinking setting correctly (#865)", () => {
+    expect(resolveThinking("off", "bb/builder")).toBe(true);
+    expect(resolveThinking("off", "mistral/codestral-2508")).toBe(true);
+    expect(resolveThinking("on", "bb/builder")).toBe(false);
+    expect(resolveThinking("on", "mistral/codestral-2508")).toBe(false);
+    expect(resolveThinking("default", "bb/builder")).toBe(true);
+    expect(resolveThinking("", "bb/builder")).toBe(true);
+    expect(resolveThinking(null, "bb/builder")).toBe(true);
+    expect(resolveThinking("default", "mistral/codestral-2508")).toBe(false);
+    expect(resolveThinking("", "mistral/codestral-2508")).toBe(false);
   });
 
   it("writes the key and session as env placeholders, never values", () => {
@@ -145,6 +158,8 @@ describe("summarize", () => {
       failedToolCalls: 1,
       input: 40,
       cached: 0,
+      cacheRead: 0,
+      turns: 3,
       output: 7,
       errors: ["401: bad key"],
       cutoff: { message: "401: bad key", code: null },
@@ -298,11 +313,150 @@ describe("github", () => {
     expect(r.items).toHaveLength(103);
     expect(seen).toHaveLength(2);
   });
+
+  it("builds the PR task from PR metadata, failing checks, and review comments (#809)", () => {
+    const pr = {
+      number: 42,
+      title: "Add widget",
+      body: "Implements widget feature",
+      head: { ref: "feat/widget", sha: "abcdef123456" },
+      base: { ref: "dev" },
+    };
+    const reviewComments = [
+      {
+        path: "src/widget.ts",
+        line: 15,
+        user: { login: "reviewer1" },
+        diff_hunk: "@@ -10,6 +10,7 @@\n+const x = null;",
+        body: "Missing null check here",
+      },
+    ];
+    const issueComments = [
+      { user: { login: "human", type: "User" }, body: "Please take a look" },
+      { user: { login: "bot", type: "Bot" }, body: "bot comment" },
+    ];
+    const failingChecks = [
+      {
+        name: "test",
+        conclusion: "failure",
+        output: {
+          title: "Unit tests failed",
+          summary: "1 test failed",
+          text: "src/widget.test.ts: FAIL",
+        },
+      },
+    ];
+
+    const md = prTaskMarkdown("o/r", pr, { reviewComments, issueComments, failingChecks });
+    expect(md).toContain("# Pull Request #42 in o/r: Add widget");
+    expect(md).toContain("- **Head branch:** `feat/widget` (abcdef1)");
+    expect(md).toContain("- **Base branch:** `dev`");
+    expect(md).toContain("## Failing Checks / CI");
+    expect(md).toContain("### `test` (failure) — Unit tests failed");
+    expect(md).toContain("src/widget.test.ts: FAIL");
+    expect(md).toContain("## Review Comments");
+    expect(md).toContain("### @reviewer1 on `src/widget.ts:15`");
+    expect(md).toContain("Missing null check here");
+    expect(md).toContain("### @human\n\nPlease take a look");
+    expect(md).not.toContain("bot comment");
+  });
+
+  it("fetches PR metadata, paginated comments and failing checks (#809)", async () => {
+    const calls = [];
+    const gh = {
+      call: async (method, path) => {
+        calls.push({ method, path });
+        if (path === "/repos/o/r/pulls/42") {
+          return {
+            ok: true,
+            status: 200,
+            data: {
+              number: 42,
+              title: "Fix bug",
+              head: { ref: "fix/bug", sha: "11223344" },
+              base: { ref: "main" },
+            },
+          };
+        }
+        if (path === "/repos/o/r/commits/11223344/check-runs") {
+          return {
+            ok: true,
+            status: 200,
+            data: {
+              check_runs: [
+                { name: "lint", conclusion: "success" },
+                { name: "test", conclusion: "failure", output: { summary: "3 failed" } },
+              ],
+            },
+          };
+        }
+        return { ok: false, status: 404 };
+      },
+      all: async (path) => {
+        calls.push({ method: "ALL", path });
+        if (path === "/repos/o/r/pulls/42/comments") {
+          return { ok: true, items: [{ id: 101, body: "fix this" }] };
+        }
+        if (path === "/repos/o/r/issues/42/comments") {
+          return { ok: true, items: [{ id: 201, body: "human comment" }] };
+        }
+        return { ok: true, items: [] };
+      },
+    };
+
+    const res = await fetchPR(gh, "o/r", 42);
+    expect(res.error).toBeUndefined();
+    expect(res.pr.number).toBe(42);
+    expect(res.reviewComments).toHaveLength(1);
+    expect(res.issueComments).toHaveLength(1);
+    expect(res.failingChecks).toHaveLength(1);
+    expect(res.failingChecks[0].name).toBe("test");
+  });
+
+  it("handles fetchPR errors gracefully (#809)", async () => {
+    const gh = {
+      call: async () => ({ ok: false, status: 404 }),
+      all: async () => ({ ok: true, items: [] }),
+    };
+    const res = await fetchPR(gh, "o/r", 999);
+    expect(res.error).toMatch(/could not read pull request #999/);
+  });
 });
 
 describe("report-failure", () => {
   it("quotes the recorded reason, or points at the log", () => {
     expect(failureComment("No Cruise key.", "https://run")).toContain("No Cruise key.");
     expect(failureComment("", "https://run")).toContain("see the run log");
+  });
+});
+
+// #865: two measured runs were pinned to a Cruise member that never cached (cruise#662).
+describe("cacheReadShare (#865)", () => {
+  // pi's `input` is the uncached part, `cacheRead` apart (a real turn: 269 + 11,264).
+  it("is cache reads over the whole prompt, from pi's own usage fields", () => {
+    const jsonl = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], usage: { input: 269, cacheRead: 11264, cacheWrite: 0, output: 40 } } });
+    const s = summarize(jsonl);
+    expect(s).toMatchObject({ input: 269, cacheRead: 11264, turns: 1 });
+    expect(cacheReadShare(s)).toBeCloseTo(11264 / 11533);
+  });
+
+  it("handles the edges", () => {
+    expect(cacheReadShare({ input: 0, cacheRead: 0 })).toBeNull();
+    expect(cacheReadShare({})).toBeNull();
+    expect(cacheReadShare({ input: 0, cacheRead: 500 })).toBe(1);
+    expect(cacheReadShare({ input: 500 })).toBe(0);
+    expect(cacheReadShare({ input: 50, cacheRead: 50 })).toBe(UNCACHED_SHARE);
+  });
+
+  it("is shown in the job summary, flagged when the provider barely cached the run", () => {
+    const md = (s) => buildJobSummary({ summary: { toolCalls: 0, tools: {}, ...s }, runId: "1" });
+    expect(md({ input: 1000, cacheRead: 9000, turns: 12 })).toContain("| Read from prompt cache | 90% |");
+    const low = md({ input: 147545, cacheRead: 1856, turns: 9 });
+    expect(low).toContain("| Read from prompt cache | ⚠️ 1%: the provider barely cached this run");
+    expect(low).toContain(UNCACHED_ISSUE);
+    // Exactly at the line is not below it; a short run is still warming the cache.
+    expect(md({ input: 50, cacheRead: 50, turns: 9 })).toContain("| Read from prompt cache | 50% |");
+    expect(md({ input: 3000, cacheRead: 500, turns: 2 })).toContain("| Read from prompt cache | 14% |");
+    expect(md({ input: 0, cacheRead: 0, turns: 0 })).not.toContain("prompt cache");
   });
 });

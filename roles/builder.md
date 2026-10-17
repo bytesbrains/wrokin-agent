@@ -24,6 +24,12 @@ questions during the run, so make sensible decisions and note them in your summa
 5. Run the checks listed under "This run" yourself, early and again before you
    finish, and fix what fails. Dependencies may need installing first (`npm ci` or
    the equivalent). Don't finish with a failing type check.
+   **Keep command output short**, for the same reason as reading by range: every line a
+   command prints is sent again on every later turn. Run the tests for what you changed
+   (a file or a name filter) while you work. When you run the whole suite, keep only the
+   end of its output, e.g. `npm test 2>&1 | tail -80`, and read more only if that
+   doesn't show what failed. Don't print install logs: `npm ci --silent` or the
+   equivalent.
 6. Commit your work with conventional commit messages (`feat:`, `fix:`, `test:`, …).
    One commit is fine; several focused ones are better than one mixed one.
 

@@ -271,7 +271,7 @@ export function premiseStopComment({ premises, base, runUrl }) {
  * The system prompt for one run: the role, then what this run found out, then the
  * repository's guidelines. The guidelines bind the work, never the run itself.
  */
-export function runPrompt({ role, base, minutes, checks, premises, guidelines }) {
+export function runPrompt({ role, base, minutes, checks, premises, guidelines, deps = null }) {
   const cmds = [checks.typecheck, checks.test].filter(Boolean);
   const parts = [
     role.trim(),
@@ -286,6 +286,15 @@ export function runPrompt({ role, base, minutes, checks, premises, guidelines })
         "a tsconfig or test-runner config, including one you leave out of the commit: fix the code, not the check."
       : "- **Checks:** the repository declares no test or typecheck command. Say so in your summary.",
   ];
+  // The install before the agent (#865): what happened, so it neither reinstalls for
+  // nothing nor assumes a toolchain that isn't there.
+  if (deps) {
+    parts.push(
+      deps.ok
+        ? `- **Dependencies:** installed before you started (\`${deps.cmd}\`). Don't reinstall unless a check says something is missing.`
+        : `- **Dependencies:** \`${deps.cmd}\` failed before you started. Install them yourself before you run the checks.`,
+    );
+  }
   if (checks.typecheck) {
     parts.push(
       `- **You can't finish on a failing typecheck:** when you stop, \`${checks.typecheck}\` runs, and if it ` +

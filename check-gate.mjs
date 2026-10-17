@@ -8,6 +8,10 @@
 // gate, and its failure makes the PR a draft. A typecheck that times out lets the run
 // settle too (#870): it gives the agent nothing to act on, and the proof-run will say
 // so. No dependencies: pi loads it as is.
+//
+// It also hands back, once, a run about to finish having changed nothing (#865): a
+// measured run described the edit it would make and stopped without making it. A run
+// that rightly changes nothing (a false premise) just says so again.
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -24,12 +28,31 @@ export function readChecks(file, read = (f) => readFileSync(f, "utf8")) {
   if (!file) return null;
   try {
     const c = JSON.parse(read(file));
-    if (typeof c?.typecheck !== "string" || !c.typecheck.trim()) return null;
+    const command = typeof c?.typecheck === "string" && c.typecheck.trim() ? c.typecheck.trim() : null;
+    const base = typeof c?.base === "string" && /^[0-9a-f]{40}$/.test(c.base) ? c.base : null;
+    if (!command && !base) return null;
     const scripts = c.scripts && typeof c.scripts === "object" ? c.scripts : {};
-    return { command: c.typecheck.trim(), scripts };
+    return { command, scripts, base };
   } catch {
     return null;
   }
+}
+
+/** The message for a run about to finish with no change since it started. */
+export const NO_CHANGE_MESSAGE =
+  "You are finishing without having changed anything: no commits and no uncommitted edits since the run " +
+  "started. Describing a change doesn't make it. If the issue needs a change, make it now with your tools, " +
+  "then run the checks. If it truly needs none (its premise is false, say), finish again with a summary that says why.";
+
+/**
+ * Whether the checkout differs from `base`: a commit on top of it, or an uncommitted
+ * edit. Fails open (true) when git can't tell, so a broken git never costs a turn.
+ */
+export async function changedSince(base, exec, cwd) {
+  const st = await exec("git", ["status", "--porcelain"], { cwd, timeout: 30_000 });
+  if (st.code !== 0 || st.stdout.trim()) return true;
+  const n = await exec("git", ["rev-list", "--count", `${base}..HEAD`], { cwd, timeout: 30_000 });
+  return n.code !== 0 || Number.parseInt(n.stdout, 10) !== 0;
 }
 
 /** package.json's scripts in `cwd` now: a regular file only. */
@@ -70,14 +93,23 @@ export function failureMessage(cmd, result, round) {
  * the event log records) plus `continue: true` for one more model request. Verified
  * against pi 1.0.4 with a stub model: fail → second request carrying the errors → pass.
  */
-export function makeGate({ command, exec, cwd, scripts = {}, scriptsNow = () => currentScripts(cwd) }) {
+export function makeGate({ command, exec, cwd, scripts = {}, scriptsNow = () => currentScripts(cwd), base = null }) {
   let rounds = 0;
+  let askedNoChange = false;
   return async (event) => {
     // Not `event.context.canContinue`: it describes the transcript BEFORE these entries,
     // which ends on the agent's own message and so is always false here. pi checks again
     // after committing them, and the hand-back message is what makes continuing valid.
-    if (!command || event.outcome !== "completed" || event.continue) return undefined;
-    if (rounds >= MAX_ROUNDS) return undefined;
+    if (event.outcome !== "completed" || event.continue) return undefined;
+    // Once per run, and apart from the typecheck's rounds: a second "no change" stands.
+    if (base && !askedNoChange && !(await changedSince(base, exec, cwd))) {
+      askedNoChange = true;
+      return {
+        entries: [{ type: "custom_message", customType: "wrokin-no-change", content: NO_CHANGE_MESSAGE, display: true }],
+        continue: true,
+      };
+    }
+    if (!command || rounds >= MAX_ROUNDS) return undefined;
     const now = scriptsNow();
     const changed = Object.keys(scripts).filter((n) => now[n] !== scripts[n]);
     if (changed.length) {
@@ -105,6 +137,12 @@ export default function checkGate(pi) {
   if (!checks) return;
   pi.on(
     "agent_before_settle",
-    makeGate({ command: checks.command, scripts: checks.scripts, exec: (c, a, o) => pi.exec(c, a, o), cwd: process.cwd() }),
+    makeGate({
+      command: checks.command,
+      scripts: checks.scripts,
+      base: checks.base,
+      exec: (c, a, o) => pi.exec(c, a, o),
+      cwd: process.cwd(),
+    }),
   );
 }
