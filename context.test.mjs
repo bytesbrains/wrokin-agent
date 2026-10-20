@@ -150,7 +150,8 @@ describe("premises", () => {
 
   it("reports what the issue names that the base doesn't have", () => {
     const dir = mkdtempSync(join(tmpdir(), "wrokin-premise-"));
-    const g = (...a) => spawnSync("git", a, { cwd: dir, encoding: "utf8" });
+    const env = { PATH: process.env.PATH, HOME: dir };
+    const g = (...a) => spawnSync("git", a, { cwd: dir, env, encoding: "utf8" });
     g("init", "-q");
     mkdirSync(join(dir, "src"));
     writeFileSync(join(dir, "src", "policy.ts"), "export function decideCompression() {}\n");
@@ -160,7 +161,7 @@ describe("premises", () => {
     const r = checkPremises({
       text: "Use `decideCompression` in `src/policy.ts` (`policy.ts`); add `compressMode` to `src/modes.ts` and `modes.ts`.",
       cwd: dir,
-      env: process.env,
+      env,
       base,
     });
     rmSync(dir, { recursive: true, force: true });

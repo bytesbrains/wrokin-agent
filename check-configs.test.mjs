@@ -11,7 +11,8 @@ import { collectCommits, finalizeCommits, git } from "./publish.mjs";
  * an `exclude` in the vitest config, turns a failing check green without touching them.
  */
 describe("check configs", () => {
-  const sh = (cwd, ...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, encoding: "utf8" });
+  const gitEnv = { PATH: process.env.PATH, HOME: tmpdir() };
+  const sh = (cwd, ...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, env: gitEnv, encoding: "utf8" });
   const write = (dir, f, body = "{}") => {
     mkdirSync(join(dir, f, ".."), { recursive: true });
     writeFileSync(join(dir, f), body);
@@ -130,8 +131,8 @@ describe("check configs", () => {
       writeFileSync(join(dir, "f"), bytes);
       for (const format of ["sha1", "sha256"]) {
         const repo = join(dir, format);
-        spawnSync("git", ["init", "-q", `--object-format=${format}`, repo]);
-        const id = spawnSync("git", ["hash-object", join(dir, "f")], { cwd: repo, encoding: "utf8" }).stdout.trim();
+        spawnSync("git", ["init", "-q", `--object-format=${format}`, repo], { env: gitEnv });
+        const id = spawnSync("git", ["hash-object", join(dir, "f")], { cwd: repo, env: gitEnv, encoding: "utf8" }).stdout.trim();
         expect(blobId(bytes, format)).toBe(id);
       }
     } finally {

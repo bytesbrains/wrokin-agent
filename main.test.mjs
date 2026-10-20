@@ -178,7 +178,7 @@ describe("main: premise stop", () => {
     const ws = join(root, "ws");
     mkdirSync(join(root, "agent"), { recursive: true });
     mkdirSync(ws);
-    const g = (...a) => spawnSync("git", a, { cwd: ws, encoding: "utf8" });
+    const g = (...a) => spawnSync("git", a, { cwd: ws, env: { PATH: process.env.PATH, HOME: root }, encoding: "utf8" });
     g("init", "-q", "-b", "main");
     writeFileSync(join(ws, "CLAUDE.md"), "Open PRs against `main`.\n");
     g("add", "-A");

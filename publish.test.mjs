@@ -283,7 +283,8 @@ describe("dropCheckoutCredentials", () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "wrokin-agent-creds-")));
     const repo = join(root, "repo");
     const temp = join(root, "runner-temp");
-    const sh = (args, cwd = repo) => spawnSync("git", args, { cwd, encoding: "utf8" });
+    const env = { PATH: process.env.PATH, HOME: root };
+    const sh = (args, cwd = repo) => spawnSync("git", args, { cwd, env, encoding: "utf8" });
     try {
       mkdirSync(temp);
       sh(["init", "-q", repo], root);
@@ -298,7 +299,7 @@ describe("dropCheckoutCredentials", () => {
       sh(["config", "--local", "http.https://github.com/.extraheader", "AUTHORIZATION: basic b2xk"]);
       expect(sh(["config", "--get-all", "http.https://github.com/.extraheader"]).stdout).toContain("c2VjcmV0");
 
-      const removed = dropCheckoutCredentials({ cwd: repo, env: process.env, runnerTemp: temp });
+      const removed = dropCheckoutCredentials({ cwd: repo, env, runnerTemp: temp });
 
       expect(sh(["config", "--get-all", "http.https://github.com/.extraheader"]).stdout).toBe("");
       expect(sh(["config", "--local", "--get-regexp", "^includeif\\."]).stdout).toBe("");
@@ -317,7 +318,7 @@ describe("dropCheckoutCredentials", () => {
  * copies the commits out with a fetch and must never run anything the agent planted.
  */
 describe("collectCommits: never runs the agent's git config", () => {
-  const sh = (cwd, ...args) => spawnSync("git", args, { cwd, encoding: "utf8" });
+  const sh = (cwd, ...args) => spawnSync("git", args, { cwd, env: { PATH: process.env.PATH, HOME: cwd }, encoding: "utf8" });
 
   it("counts the agent's commits from a bare copy, with its fsmonitor and hooks inert", () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "wa-collect-")));
