@@ -33,6 +33,10 @@ inputs:
     description: "Which Builder-family role runs: builder, builder-fix."
     required: false
     default: "builder"
+  bot_login:
+    description: "Login of the bot whose review comments carry agent prompts into the fix task (e.g. wrokin[bot]). A fix run only reads Bot comments from this author, so another app's comment can't smuggle instructions in behind the marker. Non-production apps must set their own login."
+    required: false
+    default: "wrokin[bot]"
   github_token:
     description: "Token for reading the issue, pushing the branch and opening the PR when the run doesn't check in (cruise_api_key given). With check-in, a wrokin App token for this repo is used instead. Never given to pi."
     required: false
@@ -136,6 +140,7 @@ runs:
       shell: bash
       env:
         INPUT_ROLE: ${{ inputs.role }}
+        INPUT_BOT_LOGIN: ${{ inputs.bot_login }}
         INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
         INPUT_PR_NUMBER: ${{ inputs.pr_number }}
         INPUT_MODEL: ${{ steps.creds.outputs.model }}

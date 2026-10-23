@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { main, readInputs, verifyBudget } from "./main.mjs";
+import { main, readInputs, reportCrash, verifyBudget } from "./main.mjs";
 
 const env = (over = {}) => ({
   GITHUB_REPOSITORY: "o/r",
@@ -208,5 +208,81 @@ describe("main: premise stop", () => {
     expect(posted[0].body).toContain("isn't on `main` (`CLAUDE.md` says so)");
     expect(posted[0].body).toContain("(3 of the 3 names the issue gives)");
     expect(posted.some((p) => p.path.endsWith("/pulls"))).toBe(false);
+  });
+});
+
+// #1039: the builder-fix split (#809) declared `taskFile` inside each branch, so
+// every run died with `ReferenceError: taskFile is not defined` where isolation reads
+// it — green job, no PR, no comment. Isolation itself is injected: on a sudo-capable
+// Linux runner the real prepare() would proceed into user setup and pi.
+describe("main: task file in scope past setup", () => {
+  it("reaches isolation with the task file, and comments when isolation refuses", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wrokin-main-"));
+    const ws = join(root, "ws");
+    mkdirSync(join(root, "agent"), { recursive: true });
+    mkdirSync(ws);
+    const g = (...a) => spawnSync("git", a, { cwd: ws, env: { PATH: process.env.PATH, HOME: root }, encoding: "utf8" });
+    g("init", "-q", "-b", "main");
+    writeFileSync(join(ws, "README.md"), "hello\n");
+    g("add", "-A");
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base");
+    // Plain words, no backticks: the issue names nothing, so no premise stop.
+    const issue = { number: 5, title: "Say hello", labels: [], body: "Greet every visitor warmly." };
+    const posted = [];
+    const gh = {
+      async call(method, path, body) {
+        if (method === "POST") return posted.push({ path, body: body.body }), { ok: true, status: 201, data: {} };
+        if (path === "/repos/o/r/issues/5") return { ok: true, status: 200, data: issue };
+        if (path === "/repos/o/r") return { ok: true, status: 200, data: { default_branch: "main" } };
+        return { ok: true, status: 200, data: [] };
+      },
+      async all() {
+        return { ok: true, items: [] };
+      },
+    };
+    const seen = [];
+    await main(
+      env({ GITHUB_WORKSPACE: ws, RUNNER_TEMP: root, INPUT_AGENT_DIR: join(root, "agent"), GITHUB_REF_NAME: "main", PATH: process.env.PATH }),
+      gh,
+      { prepare: (args) => (seen.push(args), { ok: false, reason: "no isolation in tests" }) },
+    );
+    rmSync(root, { recursive: true, force: true });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].readable).toContain(join(root, "wrokin-agent", "task.md"));
+    expect(posted).toHaveLength(1);
+    expect(posted[0].path).toBe("/repos/o/r/issues/5/comments");
+    expect(posted[0].body).toContain("didn't run");
+  });
+});
+
+// #1039: the entry point's catch used to log the crash and exit 0, so a crash
+// looked exactly like this issue — a green job, no PR, no comment. It comments now.
+describe("reportCrash", () => {
+  it("comments the crash on the issue, truncated to one line with the run link", async () => {
+    const gh = fakeGh({ ok: true, status: 200, data: {} });
+    await reportCrash(env(), new Error("taskFile is not defined\n    at main (main.mjs:261:16)"), gh);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]).toContain("crashed before it could finish");
+    expect(gh.comments[0]).toContain("taskFile is not defined");
+    expect(gh.comments[0]).not.toContain("at main");
+    expect(gh.comments[0]).toContain("https://github.com/o/r/actions/runs/9");
+  });
+
+  it("targets the PR on a fix run", async () => {
+    const calls = [];
+    const gh = {
+      async call(method, path, body) {
+        calls.push(path);
+        return { ok: true, status: 201, data: {} };
+      },
+    };
+    await reportCrash(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "42" }), "boom", gh);
+    expect(calls).toEqual(["/repos/o/r/issues/42/comments"]);
+  });
+
+  it("stays silent without an issue number or PR number, since there is nowhere to comment", async () => {
+    const gh = fakeGh({ ok: true, status: 200, data: {} });
+    await reportCrash(env({ INPUT_ISSUE_NUMBER: "", INPUT_PR_NUMBER: "" }), new Error("x"), gh);
+    expect(gh.comments).toEqual([]);
   });
 });

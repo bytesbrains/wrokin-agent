@@ -39,6 +39,20 @@ export function client(token, fetchFn = fetch) {
 
 const MAX_BODY = 20_000;
 const MAX_COMMENT = 4_000;
+/**
+ * A bot review comment is long (findings plus their agent prompts), and for a fix run
+ * it IS the task — so it clips at the issue-body allowance, not the comment one.
+ */
+const MAX_BOT_REVIEW = 20_000;
+/**
+ * The hidden marker in a wrokin review's combined prompt. Pinned to
+ * `AGENT_PROMPT_MARKER` in apps/pi-backend/src/services/review-agent-prompt.ts — the
+ * two are one contract across the language boundary, and a rename must move both
+ * (review-agent-prompt.test.ts asserts the literals are identical; the pin lives on the
+ * backend side because this directory is mirrored to a public repo and its tests run
+ * standalone there, where apps/ does not exist).
+ */
+export const AGENT_PROMPT_MARKER = "wrokin:agent-prompt";
 
 /** The task file pi reads: the issue as people wrote it, nothing added but structure. */
 export function taskMarkdown(repo, issue, comments) {
@@ -64,8 +78,14 @@ export async function fetchIssue(gh, repo, number) {
   return { issue: issue.data, comments: comments.items };
 }
 
-/** The task file pi reads for a PR fix: PR metadata, failing checks, review comments (#809). */
-export function prTaskMarkdown(repo, pr, { reviewComments = [], issueComments = [], failingChecks = [] } = {}) {
+/**
+ * The task file pi reads for a PR fix: PR metadata, failing checks, review comments (#809).
+ *
+ * `opts.wrokinBot` is the login whose Bot issue comments are trusted to carry agent
+ * prompts (the action's `bot_login` input). The marker alone is not enough: any app
+ * can comment, and only ours may place instructions in the task file (#1032).
+ */
+export function prTaskMarkdown(repo, pr, { reviewComments = [], issueComments = [], failingChecks = [] } = {}, opts = {}) {
   const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}\n\n[… truncated]` : s);
   const headSha = pr.head?.sha ? pr.head.sha.slice(0, 7) : "";
   const parts = [
@@ -98,6 +118,21 @@ export function prTaskMarkdown(repo, pr, { reviewComments = [], issueComments = 
       if (rc.diff_hunk) parts.push("```diff", rc.diff_hunk, "```", "");
       parts.push(clip(rc.body ?? "", MAX_COMMENT), "");
     }
+  }
+
+  // wrokin review comments carry the agent prompts the fix needs (#1022), but they
+  // are Bot comments, which the discussion filter below drops — so they are collected
+  // separately, by author login AND marker. Either alone is insufficient: the marker
+  // is public, so any app could copy it, and the login alone would sweep in status
+  // comments with no prompts. Without a known login there is no section at all.
+  const botReviews = !opts.wrokinBot
+    ? ""
+    : issueComments
+      .filter((c) => c.user?.type === "Bot" && c.user?.login === opts.wrokinBot && (c.body ?? "").includes(AGENT_PROMPT_MARKER))
+      .map((c) => `### @${c.user?.login ?? "bot"}\n\n${clip(c.body ?? "", MAX_BOT_REVIEW)}`)
+      .join("\n\n");
+  if (botReviews) {
+    parts.push("", "## Automated Review Comments", "", botReviews);
   }
 
   const thread = issueComments

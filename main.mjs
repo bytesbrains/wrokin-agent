@@ -78,6 +78,9 @@ export function readInputs(env) {
   const defaultRole = pr && !issue ? "builder-fix" : "builder";
   return {
     role: env.INPUT_ROLE || defaultRole,
+    // The action default covers a missing input, but a workflow that passes its own
+    // blank through must not silently widen the task to every bot's comments (#1032).
+    botLogin: env.INPUT_BOT_LOGIN?.trim() || "wrokin[bot]",
     issue,
     pr,
     model: env.INPUT_MODEL,
@@ -116,7 +119,9 @@ async function comment(gh, i, body) {
   await gh.call("POST", `/repos/${i.repo}/issues/${target}/comments`, { body });
 }
 
-export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN)) {
+export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN), deps = {}) {
+  // Injected in tests: the real prepare() would set up the agent's user on Linux.
+  const prepareIso = deps.prepare ?? prepare;
   const i = readInputs(env);
   if (!i.issue && !i.pr) return console.log("::error::issue_number or pr_number is required");
   if (i.issue && i.pr) {
@@ -133,6 +138,9 @@ export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN
   let base;
   let baseInfo;
   let setup;
+  // One path for both branches (#1039): each writes its own task to it, and
+  // isolation + pi read it after the branch, so it must live out here.
+  const taskFile = join(i.temp, "task.md");
   const gitEnv = scrubbedEnv(env);
 
   if (i.pr) {
@@ -157,8 +165,7 @@ export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN
     }
 
     mkdirSync(i.temp, { recursive: true });
-    const taskFile = join(i.temp, "task.md");
-    writeFileSync(taskFile, prTaskMarkdown(i.repo, ctx.pr, ctx));
+    writeFileSync(taskFile, prTaskMarkdown(i.repo, ctx.pr, ctx, { wrokinBot: i.botLogin }));
     writeFileSync(join(i.agentDir, "models.json"), JSON.stringify(modelsJson(i.model, i.baseUrl), null, 2));
 
     const dropped = dropCheckoutCredentials({ cwd: i.workspace, env: gitEnv, runnerTemp: env.RUNNER_TEMP });
@@ -193,7 +200,6 @@ export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN
     }
 
     mkdirSync(i.temp, { recursive: true });
-    const taskFile = join(i.temp, "task.md");
     writeFileSync(taskFile, taskMarkdown(i.repo, ctx.issue, ctx.comments));
     writeFileSync(join(i.agentDir, "models.json"), JSON.stringify(modelsJson(i.model, i.baseUrl), null, 2));
 
@@ -252,7 +258,7 @@ export async function main(env = process.env, gh = client(env.INPUT_GITHUB_TOKEN
 
   // Hand the checkout to the agent's user, or run nothing (#832: fail closed).
   const home = piHome(i.temp);
-  const iso = prepare({
+  const iso = prepareIso({
     workspace: i.workspace,
     writable: [i.agentDir],
     readable: [taskFile, promptFile, checksFile, here, i.pi],
@@ -475,11 +481,27 @@ async function agentRun(gh, i, { ctx, base, baseRef, branch, taskFile, promptFil
   );
 }
 
+/**
+ * The crash leg of "every outcome ends as a comment on the issue" (#1039): the
+ * entry point's catch, so an uncaught error still tells the issue instead of
+ * leaving a green job with no PR and no explanation. Silent without a target.
+ */
+export async function reportCrash(env, err, gh = client(env.INPUT_GITHUB_TOKEN)) {
+  const i = readInputs(env);
+  const first = String(err?.message ?? err ?? "unknown error").split("\n")[0].slice(0, 300);
+  await comment(gh, i, `⚠️ wrokin Builder crashed before it could finish: ${first}\n\n[Run](${i.runUrl})`);
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     await main();
   } catch (err) {
-    // Advisory: a crash here is reported, never a red job.
+    // Reported, never a red job — and the issue hears it too (#1039).
     console.log(`::error title=wrokin-agent::${err?.stack ?? err}`);
+    try {
+      await reportCrash(process.env, err);
+    } catch {
+      // Best effort: the ::error line above still says it.
+    }
   }
 }
